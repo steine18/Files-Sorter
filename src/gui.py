@@ -241,6 +241,7 @@ class App(tk.Frame):
     def _refresh_list(self) -> None:
         self._listbox.delete(0, tk.END)
         primary_name = None
+        site_number = None
         date_str = None
 
         # Build discharge display map: abs_path -> display destination
@@ -257,13 +258,13 @@ class App(tk.Frame):
             parsed = parse_primary_xml(name)
             if parsed is not None:
                 primary_name = name
-                date_str = parsed[1]
+                site_number, date_str = parsed
             display = f"{name[:_COL_FILE]:<{_COL_FILE}}  → {folder}"
             self._listbox.insert(tk.END, display)
 
         if primary_name:
             self._primary_var.set(f"Primary XML: {primary_name}")
-            self._outdir_var.set(f"Output dir:  SV_{date_str}")
+            self._outdir_var.set(f"Output dir:  {site_number}/SV_{date_str}")
         else:
             self._primary_var.set("Primary XML: (none detected)")
             self._outdir_var.set("Output dir:  —")

@@ -110,8 +110,8 @@ def sort_files(
             "No primary visit XML found (expected filename: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml)."
         )
 
-    _, date_str = parse_primary_xml(primary.name)
-    output_dir = Path(output_base_dir) / f"SV_{date_str}"
+    site_number, date_str = parse_primary_xml(primary.name)
+    output_dir = Path(output_base_dir) / site_number / f"SV_{date_str}"
 
     # Build discharge routing: absolute path string -> subfolder name within Discharge/
     discharge_map: dict[str, str] = {}
