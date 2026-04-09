@@ -12,7 +12,7 @@ _DISCHARGE_EXTENSIONS = {".rsqmb"}
 # Photos
 _PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif"}
 
-# Rawdata
+# RawData
 _RAWDATA_EXTENSIONS = {".csv", ".txt", ".dat"}
 
 
@@ -42,7 +42,7 @@ def route_file(filename: str) -> str:
 
     # 1. Primary visit XML
     if parse_primary_xml(name) is not None:
-        return "VisitXml"
+        return "VisitXML"
 
     # 2. Discharge: *_QRev.{xml,mat,pdf}  OR  *.rsqmb
     if ext in _DISCHARGE_EXTENSIONS:
@@ -56,7 +56,7 @@ def route_file(filename: str) -> str:
 
     # 4. Rawdata
     if ext in _RAWDATA_EXTENSIONS:
-        return "Rawdata"
+        return "RawData"
 
     # 5. Catch-all
     return "AncillaryFiles"

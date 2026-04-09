@@ -31,10 +31,10 @@ Files are classified in the following **priority order** (first match wins):
 
 | Destination       | Rule |
 |-------------------|------|
-| `VisitXml/`       | Filename matches `SV_<site>_<YYYYMMDD>_<HHMMSS>.xml` |
+| `VisitXML/`       | Filename matches `SV_<site>_<YYYYMMDD>_<HHMMSS>.xml` |
 | `Discharge/`      | Filename ends with `_QRev.xml`, `_QRev.mat`, `_QRev.pdf`, OR extension is `.rsqmb` |
 | `Photos/`         | Extension is `.jpg`, `.jpeg`, `.png`, or `.tif` |
-| `Rawdata/`        | Extension is `.csv`, `.txt`, or `.dat` |
+| `RawData/`        | Extension is `.csv`, `.txt`, or `.dat` |
 | `AncillaryFiles/` | Everything else (catch-all) |
 
 The primary XML rule is checked **before** the Discharge rule so that the visit XML is never
@@ -49,11 +49,11 @@ Given a primary file `SV_12345_20240315_103045.xml`, the app creates:
 ```
 <output_dir>/
 └── SV_20240315/
-    ├── VisitXml/
+    ├── VisitXML/
     │   └── SV_12345_20240315_103045.xml
     ├── Discharge/
     ├── Photos/
-    ├── Rawdata/
+    ├── RawData/
     └── AncillaryFiles/
 ```
 
