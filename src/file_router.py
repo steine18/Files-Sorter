@@ -1,5 +1,6 @@
 import re
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Regex for the primary visit XML: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml
@@ -12,8 +13,21 @@ _DISCHARGE_EXTENSIONS = {".rsqmb"}
 # Photos
 _PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif"}
 
-# Rawdata
+# RawData
 _RAWDATA_EXTENSIONS = {".csv", ".txt", ".dat"}
+
+
+@dataclass
+class DischargeGroup:
+    """A discharge measurement with its associated files."""
+    number: int
+    time: str         # hhmmss format
+    type: str         # ADCP, FT, or AA
+    files: list[str] = field(default_factory=list)  # absolute paths
+
+    @property
+    def folder_name(self) -> str:
+        return f"Discharge{self.number}.T{self.time}.{self.type}"
 
 
 def parse_primary_xml(filename: str) -> tuple[str, str] | None:
@@ -42,7 +56,7 @@ def route_file(filename: str) -> str:
 
     # 1. Primary visit XML
     if parse_primary_xml(name) is not None:
-        return "VisitXml"
+        return "VisitXML"
 
     # 2. Discharge: *_QRev.{xml,mat,pdf}  OR  *.rsqmb
     if ext in _DISCHARGE_EXTENSIONS:
@@ -54,17 +68,24 @@ def route_file(filename: str) -> str:
     if ext in _PHOTO_EXTENSIONS:
         return "Photos"
 
-    # 4. Rawdata
+    # 4. RawData
     if ext in _RAWDATA_EXTENSIONS:
-        return "Rawdata"
+        return "RawData"
 
     # 5. Catch-all
     return "AncillaryFiles"
 
 
-def sort_files(file_paths: list[str], output_base_dir: str) -> dict:
+def sort_files(
+    file_paths: list[str],
+    output_base_dir: str,
+    discharge_groups: list[DischargeGroup] | None = None,
+) -> dict:
     """
     Validate, create the output directory tree, and copy files.
+
+    discharge_groups: optional list of DischargeGroup instances; files assigned to a
+    group are placed in Discharge/{group.folder_name}/ instead of Discharge/ directly.
 
     Returns:
         {
@@ -89,20 +110,34 @@ def sort_files(file_paths: list[str], output_base_dir: str) -> dict:
             "No primary visit XML found (expected filename: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml)."
         )
 
-    _, date_str = parse_primary_xml(primary.name)
-    output_dir = Path(output_base_dir) / f"SV_{date_str}"
+    site_number, date_str = parse_primary_xml(primary.name)
+    output_dir = Path(output_base_dir) / site_number / f"SV_{date_str}"
+
+    # Build discharge routing: absolute path string -> subfolder name within Discharge/
+    discharge_map: dict[str, str] = {}
+    if discharge_groups:
+        for g in discharge_groups:
+            for fp in g.files:
+                discharge_map[str(fp)] = g.folder_name
 
     routed: dict[str, list[str]] = {}
     errors: list[tuple[str, str]] = []
 
     for p in paths:
         folder = route_file(p.name)
-        dest_dir = output_dir / folder
+        if folder == "Discharge" and str(p) in discharge_map:
+            subfolder = discharge_map[str(p)]
+            dest_dir = output_dir / "Discharge" / subfolder
+            routed_key = f"Discharge/{subfolder}"
+        else:
+            dest_dir = output_dir / folder
+            routed_key = folder
+
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / p.name
         try:
             shutil.copy2(p, dest)
-            routed.setdefault(folder, []).append(p.name)
+            routed.setdefault(routed_key, []).append(p.name)
         except OSError as exc:
             errors.append((p.name, str(exc)))
 
