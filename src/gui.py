@@ -410,7 +410,8 @@ class DischargeGroupDialog(tk.Toplevel):
 
         vsb2 = tk.Scrollbar(right, orient=tk.VERTICAL)
         self._unassigned_lb = tk.Listbox(
-            right, yscrollcommand=vsb2.set, selectmode=tk.EXTENDED, font=("Courier", 9)
+            right, yscrollcommand=vsb2.set, selectmode=tk.EXTENDED, font=("Courier", 9),
+            exportselection=False,
         )
         vsb2.config(command=self._unassigned_lb.yview)
         vsb2.pack(side=tk.RIGHT, fill=tk.Y)
