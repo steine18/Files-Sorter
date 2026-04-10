@@ -6,9 +6,9 @@ from pathlib import Path
 # Regex for the primary visit XML: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml
 _PRIMARY_XML_RE = re.compile(r"^SV_.+_(\d{8})_\d{6}\.xml$", re.IGNORECASE)
 
-# Discharge: files whose stem ends with _QRev (any of these extensions) or .rsqmb
+# Discharge: files whose stem ends with _QRev (any of these extensions), .rsqmb, or .ft
 _QREV_EXTENSIONS = {".xml", ".mat", ".pdf"}
-_DISCHARGE_EXTENSIONS = {".rsqmb"}
+_DISCHARGE_EXTENSIONS = {".rsqmb", ".ft"}
 
 # Photos
 _PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif"}
@@ -80,12 +80,15 @@ def sort_files(
     file_paths: list[str],
     output_base_dir: str,
     discharge_groups: list[DischargeGroup] | None = None,
+    overrides: dict[str, str] | None = None,
 ) -> dict:
     """
     Validate, create the output directory tree, and copy files.
 
     discharge_groups: optional list of DischargeGroup instances; files assigned to a
     group are placed in Discharge/{group.folder_name}/ instead of Discharge/ directly.
+    overrides: optional dict mapping absolute path string -> folder name, applied before
+    automatic routing rules.
 
     Returns:
         {
@@ -124,7 +127,11 @@ def sort_files(
     errors: list[tuple[str, str]] = []
 
     for p in paths:
-        folder = route_file(p.name)
+        # Manual override takes priority over automatic routing
+        if overrides and str(p) in overrides:
+            folder = overrides[str(p)]
+        else:
+            folder = route_file(p.name)
         if folder == "Discharge" and str(p) in discharge_map:
             subfolder = discharge_map[str(p)]
             dest_dir = output_dir / "Discharge" / subfolder

@@ -11,9 +11,9 @@ from src.file_router import DischargeGroup, parse_primary_xml, route_file, sort_
 
 # Column widths
 _COL_FILE = 45
-_COL_DEST = 16
 
 _DISCHARGE_TYPES = ("ADCP", "FT", "AA")
+_ALL_CATEGORIES = ("VisitXML", "Discharge", "Photos", "RawData", "AncillaryFiles")
 
 
 class App(tk.Frame):
@@ -26,8 +26,9 @@ class App(tk.Frame):
         self.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         self._config = load_config()
-        self._file_paths: list[str] = []          # absolute paths of dropped files
+        self._file_paths: list[str] = []                    # absolute paths of dropped files
         self._discharge_groups: list[DischargeGroup] = []
+        self._route_overrides: dict[str, str] = {}          # abs path -> manual category
 
         self._build_ui()
 
@@ -88,9 +89,11 @@ class App(tk.Frame):
 
         header = tk.Frame(list_frame)
         header.pack(fill=tk.X)
-        tk.Label(header, text=f"{'File':<{_COL_FILE}}  {'→ Folder'}", font=("Courier", 9, "bold")).pack(
-            anchor="w", padx=4
-        )
+        tk.Label(
+            header,
+            text=f"{'File':<{_COL_FILE}}  {'→ Folder'}",
+            font=("Courier", 9, "bold"),
+        ).pack(anchor="w", padx=4)
         ttk.Separator(list_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
         scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL)
@@ -104,6 +107,7 @@ class App(tk.Frame):
         scrollbar.config(command=self._listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self._listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._listbox.bind("<Button-3>", self._on_right_click)
 
         # --- Buttons ---
         btn_frame = tk.Frame(self)
@@ -112,7 +116,9 @@ class App(tk.Frame):
         tk.Button(btn_frame, text="Add Files", width=12, command=self._add_files).pack(
             side=tk.LEFT, padx=(0, 4)
         )
-        tk.Button(btn_frame, text="Clear", width=10, command=self._clear).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(btn_frame, text="Clear", width=10, command=self._clear).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
         tk.Button(
             btn_frame,
             text="Discharge Groups",
@@ -134,7 +140,6 @@ class App(tk.Frame):
     # ------------------------------------------------------------------
 
     def _on_drop(self, event) -> None:
-        # tkinterdnd2 returns a space-separated string; brace-quoted paths handle spaces
         raw = event.data
         paths = self._parse_drop_data(raw)
         self._add_paths(paths)
@@ -151,14 +156,12 @@ class App(tk.Frame):
                 paths.append(raw[i + 1 : end])
                 i = end + 1
             else:
-                # Space-separated token
                 end = raw.find(" ", i)
                 if end == -1:
                     paths.append(raw[i:])
                     break
                 paths.append(raw[i:end])
                 i = end
-            # Skip whitespace between tokens
             while i < len(raw) and raw[i] == " ":
                 i += 1
         return [p for p in paths if p]
@@ -179,6 +182,7 @@ class App(tk.Frame):
     def _clear(self) -> None:
         self._file_paths.clear()
         self._discharge_groups.clear()
+        self._route_overrides.clear()
         self._listbox.delete(0, tk.END)
         self._primary_var.set("Primary XML: (none detected)")
         self._outdir_var.set("Output dir:  —")
@@ -194,7 +198,7 @@ class App(tk.Frame):
             save_config(self._config)
 
     def _manage_discharge(self) -> None:
-        discharge_files = [p for p in self._file_paths if route_file(Path(p).name) == "Discharge"]
+        discharge_files = [p for p in self._file_paths if self._effective_route(p) == "Discharge"]
         if not discharge_files:
             messagebox.showinfo("No discharge files", "No discharge files have been added yet.")
             return
@@ -203,6 +207,55 @@ class App(tk.Frame):
         if dlg.result is not None:
             self._discharge_groups = dlg.result
             self._refresh_list()
+
+    def _on_right_click(self, event: tk.Event) -> None:
+        idx = self._listbox.nearest(event.y)
+        if idx < 0 or idx >= len(self._file_paths):
+            return
+
+        # If the clicked row isn't in the current selection, select only it
+        if idx not in self._listbox.curselection():
+            self._listbox.selection_clear(0, tk.END)
+            self._listbox.selection_set(idx)
+
+        selected_indices = list(self._listbox.curselection())
+        selected_paths = [self._file_paths[i] for i in selected_indices]
+
+        count = len(selected_paths)
+        label = "Set category" if count == 1 else f"Set category  ({count} files)"
+
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label=label, state=tk.DISABLED)
+        menu.add_separator()
+        for cat in _ALL_CATEGORIES:
+            menu.add_command(
+                label=cat,
+                command=lambda c=cat, pp=selected_paths: self._set_category(pp, c),
+            )
+        menu.add_separator()
+        menu.add_command(
+            label="Reset to auto",
+            command=lambda pp=selected_paths: self._set_category(pp, None),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _set_category(self, paths: list[str], category: str | None) -> None:
+        for p in paths:
+            if category is None:
+                self._route_overrides.pop(p, None)
+                # If auto-route is no longer Discharge, drop from any group
+                if route_file(Path(p).name) != "Discharge":
+                    self._remove_from_discharge_groups(p)
+            else:
+                self._route_overrides[p] = category
+                if category != "Discharge":
+                    self._remove_from_discharge_groups(p)
+        self._refresh_list()
+
+    def _remove_from_discharge_groups(self, path: str) -> None:
+        for g in self._discharge_groups:
+            if path in g.files:
+                g.files.remove(path)
 
     def _sort(self) -> None:
         if not self._file_paths:
@@ -213,7 +266,12 @@ class App(tk.Frame):
             messagebox.showerror("No output folder", "Please set an output folder first.")
             return
         try:
-            result = sort_files(self._file_paths, output_base, self._discharge_groups or None)
+            result = sort_files(
+                self._file_paths,
+                output_base,
+                self._discharge_groups or None,
+                self._route_overrides or None,
+            )
         except ValueError as exc:
             messagebox.showerror("Cannot sort", str(exc))
             return
@@ -224,7 +282,9 @@ class App(tk.Frame):
 
         summary_lines = [f"Sorted to: {out_dir}\n"]
         for folder, names in sorted(routed.items()):
-            summary_lines.append(f"  {folder}/  ({len(names)} file{'s' if len(names) != 1 else ''})")
+            summary_lines.append(
+                f"  {folder}/  ({len(names)} file{'s' if len(names) != 1 else ''})"
+            )
 
         if errors:
             summary_lines.append(f"\nErrors ({len(errors)}):")
@@ -238,6 +298,12 @@ class App(tk.Frame):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _effective_route(self, path: str) -> str:
+        """Return the active category for a file, respecting manual overrides."""
+        if path in self._route_overrides:
+            return self._route_overrides[path]
+        return route_file(Path(path).name)
+
     def _refresh_list(self) -> None:
         self._listbox.delete(0, tk.END)
         primary_name = None
@@ -250,17 +316,23 @@ class App(tk.Frame):
             for fp in g.files:
                 discharge_display[fp] = f"Discharge/{g.folder_name}"
 
-        for path in self._file_paths:
+        for idx, path in enumerate(self._file_paths):
             name = Path(path).name
-            folder = route_file(name)
+            folder = self._effective_route(path)
             if folder == "Discharge" and path in discharge_display:
                 folder = discharge_display[path]
+
             parsed = parse_primary_xml(name)
             if parsed is not None:
                 primary_name = name
                 site_number, date_str = parsed
-            display = f"{name[:_COL_FILE]:<{_COL_FILE}}  → {folder}"
+
+            manual = path in self._route_overrides
+            suffix = " [*]" if manual else ""
+            display = f"{name[:_COL_FILE]:<{_COL_FILE}}  → {folder}{suffix}"
             self._listbox.insert(tk.END, display)
+            if manual:
+                self._listbox.itemconfigure(idx, fg="#0055aa")
 
         if primary_name:
             self._primary_var.set(f"Primary XML: {primary_name}")
@@ -347,7 +419,9 @@ class DischargeGroupDialog(tk.Toplevel):
         # Bottom: OK / Cancel
         bottom = tk.Frame(self, pady=6)
         bottom.pack(fill=tk.X, padx=8)
-        tk.Button(bottom, text="Cancel", width=10, command=self.destroy).pack(side=tk.RIGHT, padx=(4, 0))
+        tk.Button(bottom, text="Cancel", width=10, command=self.destroy).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
         tk.Button(
             bottom, text="OK", width=10, bg="#2e7d32", fg="white", command=self._ok
         ).pack(side=tk.RIGHT)
@@ -386,7 +460,9 @@ class DischargeGroupDialog(tk.Toplevel):
         selected_indices = sorted(self._unassigned_lb.curselection())
         selected_files = [self._unassigned[i] for i in selected_indices]
 
-        g = DischargeGroup(number=self._next_number, time=time_val, type=type_val, files=selected_files)
+        g = DischargeGroup(
+            number=self._next_number, time=time_val, type=type_val, files=selected_files
+        )
         self._next_number += 1
         self._groups.append(g)
 
@@ -407,7 +483,9 @@ class DischargeGroupDialog(tk.Toplevel):
     def _assign_to_group(self) -> None:
         group = self._selected_group()
         if group is None:
-            messagebox.showwarning("No group selected", "Select a group in the left panel.", parent=self)
+            messagebox.showwarning(
+                "No group selected", "Select a group in the left panel.", parent=self
+            )
             return
         selected_indices = sorted(self._unassigned_lb.curselection())
         if not selected_indices:
@@ -479,7 +557,9 @@ class _GroupPropertiesDialog(tk.Toplevel):
     def _on_ok(self) -> None:
         t = self._time_var.get().strip()
         if not re.fullmatch(r"\d{6}", t):
-            messagebox.showerror("Invalid time", "Enter exactly 6 digits for hhmmss (e.g. 103045).", parent=self)
+            messagebox.showerror(
+                "Invalid time", "Enter exactly 6 digits for hhmmss (e.g. 103045).", parent=self
+            )
             return
         self.result = (t, self._type_var.get())
         self.destroy()
