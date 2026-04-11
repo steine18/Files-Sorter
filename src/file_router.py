@@ -1,20 +1,63 @@
+import json
 import re
 import shutil
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_AQ_NS = "http://water.usgs.gov/XML/AQ"
+
+# MeasurementMethodCode → folder type (QZEROF intentionally omitted = no folder)
+_METHOD_TYPE_MAP = {"QADCP": "ADCP"}
+# VelocityMethodCode → folder type (used when method is QMIDSECTION etc.)
+_VELOCITY_TYPE_MAP = {
+    "WVADVM": "FT",   # FlowTracker / ADV
+    "WVAA":   "AA",   # Price AA current meter
+}
 
 # Regex for the primary visit XML: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml
 _PRIMARY_XML_RE = re.compile(r"^SV_.+_(\d{8})_\d{6}\.xml$", re.IGNORECASE)
 
-# Discharge: files whose stem ends with _QRev (any of these extensions) or .rsqmb
-_QREV_EXTENSIONS = {".xml", ".mat", ".pdf"}
-_DISCHARGE_EXTENSIONS = {".rsqmb"}
+ROUTING_PATH = Path(__file__).parent.parent / "routing.json"
 
-# Photos
-_PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif"}
+_ROUTING_DEFAULTS: dict = {
+    "Discharge": {
+        "extensions": [".rsqmb"],
+        "qrev_extensions": [".xml", ".mat", ".pdf"],
+    },
+    "Photos": {"extensions": [".jpg", ".jpeg", ".png", ".tif"]},
+    "RawData": {"extensions": [".csv", ".txt", ".dat"]},
+}
 
-# RawData
-_RAWDATA_EXTENSIONS = {".csv", ".txt", ".dat"}
+_routing_cache: dict | None = None
+
+
+def load_routing() -> dict:
+    """Load routing.json, falling back to built-in defaults on any error."""
+    if ROUTING_PATH.exists():
+        try:
+            with ROUTING_PATH.open() as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return json.loads(json.dumps(_ROUTING_DEFAULTS))  # deep copy of defaults
+
+
+def save_routing(routing: dict) -> None:
+    with ROUTING_PATH.open("w") as f:
+        json.dump(routing, f, indent=2)
+
+
+def reload_routing_cache() -> None:
+    global _routing_cache
+    _routing_cache = None
+
+
+def _get_routing() -> dict:
+    global _routing_cache
+    if _routing_cache is None:
+        _routing_cache = load_routing()
+    return _routing_cache
 
 
 @dataclass
@@ -54,23 +97,26 @@ def route_file(filename: str) -> str:
     ext = Path(filename).suffix.lower()
     stem = Path(filename).stem
 
-    # 1. Primary visit XML
+    # 1. Primary visit XML (hardcoded — pattern-based, not extension-based)
     if parse_primary_xml(name) is not None:
         return "VisitXML"
 
-    # 2. Discharge: *_QRev.{xml,mat,pdf}  OR  *.rsqmb
-    if ext in _DISCHARGE_EXTENSIONS:
+    routing = _get_routing()
+
+    # 2. Discharge
+    discharge = routing.get("Discharge", {})
+    discharge_exts = {e.lower() for e in discharge.get("extensions", [])}
+    qrev_exts = {e.lower() for e in discharge.get("qrev_extensions", [])}
+    if ext in discharge_exts:
         return "Discharge"
-    if ext in _QREV_EXTENSIONS and stem.endswith("_QRev"):
+    if ext in qrev_exts and stem.endswith("_QRev"):
         return "Discharge"
 
-    # 3. Photos
-    if ext in _PHOTO_EXTENSIONS:
-        return "Photos"
-
-    # 4. RawData
-    if ext in _RAWDATA_EXTENSIONS:
-        return "RawData"
+    # 3. Photos, 4. RawData (order matches routing.json key order)
+    for folder in ("Photos", "RawData"):
+        folder_exts = {e.lower() for e in routing.get(folder, {}).get("extensions", [])}
+        if ext in folder_exts:
+            return folder
 
     # 5. Catch-all
     return "AncillaryFiles"
@@ -113,12 +159,13 @@ def sort_files(
     site_number, date_str = parse_primary_xml(primary.name)
     output_dir = Path(output_base_dir) / site_number / f"SV_{date_str}"
 
-    # Build discharge routing: absolute path string -> subfolder name within Discharge/
-    discharge_map: dict[str, str] = {}
+    # Build discharge routing: absolute path string -> list of subfolders within Discharge/
+    # A file may be assigned to more than one group and will be copied to each.
+    discharge_map: dict[str, list[str]] = {}
     if discharge_groups:
         for g in discharge_groups:
             for fp in g.files:
-                discharge_map[str(fp)] = g.folder_name
+                discharge_map.setdefault(str(fp), []).append(g.folder_name)
 
     routed: dict[str, list[str]] = {}
     errors: list[tuple[str, str]] = []
@@ -126,23 +173,79 @@ def sort_files(
     for p in paths:
         folder = route_file(p.name)
         if folder == "Discharge" and str(p) in discharge_map:
-            subfolder = discharge_map[str(p)]
-            dest_dir = output_dir / "Discharge" / subfolder
-            routed_key = f"Discharge/{subfolder}"
+            for subfolder in discharge_map[str(p)]:
+                dest_dir = output_dir / "Discharge" / subfolder
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(p, dest_dir / p.name)
+                    routed.setdefault(f"Discharge/{subfolder}", []).append(p.name)
+                except OSError as exc:
+                    errors.append((p.name, str(exc)))
         else:
             dest_dir = output_dir / folder
-            routed_key = folder
-
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / p.name
-        try:
-            shutil.copy2(p, dest)
-            routed.setdefault(routed_key, []).append(p.name)
-        except OSError as exc:
-            errors.append((p.name, str(exc)))
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(p, dest_dir / p.name)
+                routed.setdefault(folder, []).append(p.name)
+            except OSError as exc:
+                errors.append((p.name, str(exc)))
 
     return {
         "output_dir": str(output_dir),
         "routed": routed,
         "errors": errors,
     }
+
+
+def parse_discharge_groups(xml_path: str) -> list[DischargeGroup]:
+    """Parse a primary visit XML and return DischargeGroup objects with time and type
+    pre-filled from the XML. QZEROF measurements are skipped (no files, no folder).
+    Files lists are left empty — the user assigns those in the dialog.
+
+    Returns an empty list if the file cannot be parsed.
+    """
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, OSError):
+        return []
+
+    root = tree.getroot()
+    groups: list[DischargeGroup] = []
+    number = 1
+
+    for dm in root.findall(f".//{{{_AQ_NS}}}DischargeMeasurement"):
+        # --- Extract time from DischargeDateTime ---
+        dt_el = dm.find(f"{{{_AQ_NS}}}DischargeDateTime")
+        if dt_el is None or not dt_el.text:
+            continue
+        try:
+            # Format: "2026-04-09T09:56:30-07:00" → "095630"
+            time_str = dt_el.text.split("T")[1][:8].replace(":", "")
+        except IndexError:
+            continue
+
+        # --- Determine type from method codes in first Channel ---
+        channel = dm.find(f"{{{_AQ_NS}}}Channel")
+        if channel is None:
+            continue
+
+        method_el = channel.find(f"{{{_AQ_NS}}}MeasurementMethodCode")
+        if method_el is None:
+            continue
+        method_code = (method_el.text or "").strip()
+
+        if method_code == "QZEROF":
+            continue  # zero flow — no folder
+
+        if method_code in _METHOD_TYPE_MAP:
+            mtype = _METHOD_TYPE_MAP[method_code]
+        else:
+            # Fall back to velocity method code (distinguishes FT from AA)
+            vel_el = channel.find(f"{{{_AQ_NS}}}VelocityMethodCode")
+            vel_code = (vel_el.text if vel_el is not None else "").strip()
+            mtype = _VELOCITY_TYPE_MAP.get(vel_code, "FT")
+
+        groups.append(DischargeGroup(number=number, time=time_str, type=mtype))
+        number += 1
+
+    return groups
