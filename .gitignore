@@ -1,0 +1,13 @@
+# Claude documentation
+CLAUDE.md
+
+# Example data
+Example/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Config (contains local paths)
+config.json

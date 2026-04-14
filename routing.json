@@ -1,0 +1,29 @@
+{
+  "Discharge": {
+    "extensions": [
+      ".rsqmb",
+      ".ft"
+    ],
+    "qrev_extensions": [
+      ".xml",
+      ".mat",
+      ".pdf"
+    ]
+  },
+  "Photos": {
+    "extensions": [
+      ".jpg",
+      ".jpeg",
+      ".png",
+      ".tif",
+      ".mov"
+    ]
+  },
+  "RawData": {
+    "extensions": [
+      ".csv",
+      ".txt",
+      ".dat"
+    ]
+  }
+}

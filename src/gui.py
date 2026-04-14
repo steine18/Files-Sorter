@@ -6,29 +6,44 @@ from pathlib import Path
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
+from src.archive_sync import VisitSyncStatus, populate_remote, scan_local_visits, sync_visit
 from src.config import load_config, save_config
-from src.file_router import DischargeGroup, parse_primary_xml, route_file, sort_files
+from src.file_router import (
+    DischargeGroup, load_routing, parse_discharge_groups, parse_primary_xml,
+    reload_routing_cache, route_file, save_routing, sort_files,
+)
 
-# Column widths
+# Column widths for the sort file list
 _COL_FILE = 45
 
 _DISCHARGE_TYPES = ("ADCP", "FT", "AA")
 _ALL_CATEGORIES = ("VisitXML", "Discharge", "Photos", "RawData", "AncillaryFiles")
+
+_SYNC_STATUS_COLORS = {
+    "synced":  "#e8f5e9",
+    "partial": "#fff9c4",
+    "missing": "#ffebee",
+}
 
 
 class App(tk.Frame):
     def __init__(self, master: TkinterDnD.Tk):
         super().__init__(master)
         self.master = master
-        master.title("Files Sorter")
+        master.title("File Sorter")
         master.resizable(True, True)
-        master.minsize(620, 480)
+        master.minsize(680, 540)
         self.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         self._config = load_config()
-        self._file_paths: list[str] = []                    # absolute paths of dropped files
+
+        # Sort tab state
+        self._file_paths: list[str] = []
         self._discharge_groups: list[DischargeGroup] = []
         self._route_overrides: dict[str, str] = {}          # abs path -> manual category
+
+        # Archive sync tab state
+        self._visits: list[VisitSyncStatus] = []
 
         self._build_ui()
 
@@ -37,7 +52,7 @@ class App(tk.Frame):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        # --- Output directory row ---
+        # --- Output directory row (shared, always visible) ---
         out_frame = tk.Frame(self)
         out_frame.pack(fill=tk.X, pady=(0, 6))
 
@@ -54,9 +69,23 @@ class App(tk.Frame):
             side=tk.LEFT
         )
 
+        # --- Notebook ---
+        self._notebook = ttk.Notebook(self)
+        self._notebook.pack(fill=tk.BOTH, expand=True)
+
+        sort_tab = tk.Frame(self._notebook)
+        self._notebook.add(sort_tab, text="  Sort Files  ")
+
+        sync_tab = tk.Frame(self._notebook)
+        self._notebook.add(sync_tab, text="  Archive Sync  ")
+
+        self._build_sort_tab(sort_tab)
+        self._build_sync_tab(sync_tab)
+
+    def _build_sort_tab(self, parent: tk.Frame) -> None:
         # --- Drop zone ---
-        drop_frame = tk.LabelFrame(self, text="Drop files here", padx=8, pady=8)
-        drop_frame.pack(fill=tk.X, pady=(0, 6))
+        drop_frame = tk.LabelFrame(parent, text="Drop files here", padx=8, pady=8)
+        drop_frame.pack(fill=tk.X, pady=(8, 6), padx=8)
 
         self._drop_label = tk.Label(
             drop_frame,
@@ -71,21 +100,17 @@ class App(tk.Frame):
         self._drop_label.dnd_bind("<<Drop>>", self._on_drop)
 
         # --- Status bar ---
-        status_frame = tk.Frame(self)
-        status_frame.pack(fill=tk.X, pady=(0, 4))
+        status_frame = tk.Frame(parent)
+        status_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
 
         self._primary_var = tk.StringVar(value="Primary XML: (none detected)")
         self._outdir_var = tk.StringVar(value="Output dir:  —")
-        tk.Label(status_frame, textvariable=self._primary_var, anchor="w").pack(
-            fill=tk.X, side=tk.TOP
-        )
-        tk.Label(status_frame, textvariable=self._outdir_var, anchor="w").pack(
-            fill=tk.X, side=tk.TOP
-        )
+        tk.Label(status_frame, textvariable=self._primary_var, anchor="w").pack(fill=tk.X)
+        tk.Label(status_frame, textvariable=self._outdir_var, anchor="w").pack(fill=tk.X)
 
         # --- File list ---
-        list_frame = tk.LabelFrame(self, text="Files to sort")
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        list_frame = tk.LabelFrame(parent, text="Files to sort")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
 
         header = tk.Frame(list_frame)
         header.pack(fill=tk.X)
@@ -110,8 +135,8 @@ class App(tk.Frame):
         self._listbox.bind("<Button-3>", self._on_right_click)
 
         # --- Buttons ---
-        btn_frame = tk.Frame(self)
-        btn_frame.pack(fill=tk.X)
+        btn_frame = tk.Frame(parent)
+        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
 
         tk.Button(btn_frame, text="Add Files", width=12, command=self._add_files).pack(
             side=tk.LEFT, padx=(0, 4)
@@ -120,28 +145,89 @@ class App(tk.Frame):
             side=tk.LEFT, padx=(0, 4)
         )
         tk.Button(
-            btn_frame,
-            text="Discharge Groups",
-            width=16,
-            command=self._manage_discharge,
+            btn_frame, text="Discharge Groups", width=16, command=self._manage_discharge
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(
+            btn_frame, text="Routing...", width=10, command=self._edit_routing
         ).pack(side=tk.LEFT)
         tk.Button(
             btn_frame,
             text="Sort Files",
             width=14,
-            bg="#2e7d32",
-            fg="white",
-            font=("TkDefaultFont", 10, "bold"),
             command=self._sort,
         ).pack(side=tk.RIGHT)
 
+    def _build_sync_tab(self, parent: tk.Frame) -> None:
+        # --- Archive destination root row ---
+        dst_frame = tk.Frame(parent)
+        dst_frame.pack(fill=tk.X, padx=8, pady=(8, 6))
+
+        tk.Label(dst_frame, text="Archive destination root:").pack(side=tk.LEFT)
+        self._dst_var = tk.StringVar(value=self._config.get("archive_dst_root", ""))
+        tk.Label(
+            dst_frame,
+            textvariable=self._dst_var,
+            relief=tk.SUNKEN,
+            anchor="w",
+            width=48,
+        ).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        tk.Button(dst_frame, text="Browse...", command=self._sync_browse_dst).pack(side=tk.LEFT)
+
+        # --- Treeview ---
+        tree_frame = tk.LabelFrame(parent, text="Local site visits")
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+
+        cols = ("site", "date", "wy", "status", "local_n", "remote_n")
+        vsb = tk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self._sync_tree = ttk.Treeview(
+            tree_frame,
+            columns=cols,
+            show="headings",
+            selectmode="extended",
+            yscrollcommand=vsb.set,
+        )
+        vsb.config(command=self._sync_tree.yview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._sync_tree.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        col_defs = [
+            ("site",     "Site ID",      110),
+            ("date",     "Visit Date",    95),
+            ("wy",       "Water Year",    80),
+            ("status",   "Status",        80),
+            ("local_n",  "Local Files",   85),
+            ("remote_n", "Remote Files",  90),
+        ]
+        for col, heading, width in col_defs:
+            self._sync_tree.heading(col, text=heading, anchor="w")
+            self._sync_tree.column(col, width=width, anchor="w", stretch=(col == "site"))
+
+        for tag, color in _SYNC_STATUS_COLORS.items():
+            self._sync_tree.tag_configure(tag, background=color)
+
+        # --- Buttons ---
+        btn_frame = tk.Frame(parent)
+        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        tk.Button(btn_frame, text="Scan", width=10, command=self._sync_scan).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        tk.Button(btn_frame, text="Sync Selected", width=14, command=self._sync_selected).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+        tk.Button(
+            btn_frame,
+            text="Sync All",
+            width=10,
+            command=self._sync_all,
+        ).pack(side=tk.LEFT)
+
     # ------------------------------------------------------------------
-    # Event handlers
+    # Sort tab — event handlers
     # ------------------------------------------------------------------
 
     def _on_drop(self, event) -> None:
-        raw = event.data
-        paths = self._parse_drop_data(raw)
+        paths = self._parse_drop_data(event.data)
         self._add_paths(paths)
 
     @staticmethod
@@ -177,7 +263,19 @@ class App(tk.Frame):
             if p not in existing:
                 self._file_paths.append(p)
                 existing.add(p)
+        self._auto_parse_discharge_groups()
         self._refresh_list()
+
+    def _auto_parse_discharge_groups(self) -> None:
+        """If no discharge groups exist yet, parse the primary XML and pre-populate them."""
+        if self._discharge_groups:
+            return
+        primary = next(
+            (p for p in self._file_paths if parse_primary_xml(Path(p).name) is not None),
+            None,
+        )
+        if primary:
+            self._discharge_groups = parse_discharge_groups(primary)
 
     def _clear(self) -> None:
         self._file_paths.clear()
@@ -257,6 +355,13 @@ class App(tk.Frame):
             if path in g.files:
                 g.files.remove(path)
 
+    def _edit_routing(self) -> None:
+        dlg = RoutingConfigDialog(self.master)
+        self.master.wait_window(dlg)
+        if dlg.saved:
+            reload_routing_cache()
+            self._refresh_list()
+
     def _sort(self) -> None:
         if not self._file_paths:
             messagebox.showwarning("No files", "Please add files before sorting.")
@@ -294,15 +399,12 @@ class App(tk.Frame):
         else:
             messagebox.showinfo("Sort complete", "\n".join(summary_lines))
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     def _effective_route(self, path: str) -> str:
         """Return the active category for a file, respecting manual overrides."""
         if path in self._route_overrides:
             return self._route_overrides[path]
         return route_file(Path(path).name)
+
 
     def _refresh_list(self) -> None:
         self._listbox.delete(0, tk.END)
@@ -310,18 +412,21 @@ class App(tk.Frame):
         site_number = None
         date_str = None
 
-        # Build discharge display map: abs_path -> display destination
-        discharge_display: dict[str, str] = {}
+        # A file may be in multiple groups; track all assignments per path
+        discharge_display: dict[str, list[str]] = {}
         for g in self._discharge_groups:
             for fp in g.files:
-                discharge_display[fp] = f"Discharge/{g.folder_name}"
+                discharge_display.setdefault(fp, []).append(g.folder_name)
 
         for idx, path in enumerate(self._file_paths):
             name = Path(path).name
             folder = self._effective_route(path)
             if folder == "Discharge" and path in discharge_display:
-                folder = discharge_display[path]
-
+                groups = discharge_display[path]
+                if len(groups) == 1:
+                    folder = f"Discharge/{groups[0]}"
+                else:
+                    folder = f"Discharge/ ({len(groups)} groups)"
             parsed = parse_primary_xml(name)
             if parsed is not None:
                 primary_name = name
@@ -341,6 +446,117 @@ class App(tk.Frame):
             self._primary_var.set("Primary XML: (none detected)")
             self._outdir_var.set("Output dir:  —")
 
+    # ------------------------------------------------------------------
+    # Archive sync tab — event handlers
+    # ------------------------------------------------------------------
+
+    def _sync_browse_dst(self) -> None:
+        folder = filedialog.askdirectory(
+            title="Select archive destination root (DST folder)",
+            initialdir=self._dst_var.get() or "",
+        )
+        if folder:
+            self._dst_var.set(folder)
+            self._config["archive_dst_root"] = folder
+            save_config(self._config)
+
+    def _sync_scan(self) -> None:
+        output_dir = self._config.get("output_dir", "")
+        dst_root = self._dst_var.get()
+        if not output_dir:
+            messagebox.showerror(
+                "No output folder", "Set the output folder using Change Folder above.", parent=self.master
+            )
+            return
+        if not dst_root:
+            messagebox.showerror(
+                "No destination", "Set the archive destination root first.", parent=self.master
+            )
+            return
+
+        self.master.config(cursor="watch")
+        self.master.update()
+        try:
+            self._visits = scan_local_visits(output_dir)
+            populate_remote(self._visits, dst_root)
+        finally:
+            self.master.config(cursor="")
+
+        self._sync_refresh_tree()
+        if not self._visits:
+            messagebox.showinfo(
+                "No visits found",
+                f"No SV_YYYYMMDD directories found under:\n{output_dir}",
+                parent=self.master,
+            )
+
+    def _sync_refresh_tree(self) -> None:
+        self._sync_tree.delete(*self._sync_tree.get_children())
+        for i, v in enumerate(self._visits):
+            date_display = f"{v.date_str[:4]}-{v.date_str[4:6]}-{v.date_str[6:]}"
+            self._sync_tree.insert(
+                "",
+                tk.END,
+                iid=str(i),
+                values=(
+                    v.site_id,
+                    date_display,
+                    v.water_year_str,
+                    v.status.capitalize(),
+                    len(v.local_files),
+                    len(v.remote_files),
+                ),
+                tags=(v.status,),
+            )
+
+    def _sync_selected_visits(self) -> list[VisitSyncStatus]:
+        return [self._visits[int(iid)] for iid in self._sync_tree.selection()]
+
+    def _sync_selected(self) -> None:
+        selected = self._sync_selected_visits()
+        if not selected:
+            messagebox.showwarning(
+                "Nothing selected", "Select one or more visits to sync.", parent=self.master
+            )
+            return
+        self._run_sync(selected)
+
+    def _sync_all(self) -> None:
+        if not self._visits:
+            messagebox.showwarning("Not scanned", "Click Scan first.", parent=self.master)
+            return
+        to_sync = [v for v in self._visits if v.status != "synced"]
+        if not to_sync:
+            messagebox.showinfo(
+                "Already synced", "All local visits are present on the remote.", parent=self.master
+            )
+            return
+        self._run_sync(to_sync)
+
+    def _run_sync(self, visits: list[VisitSyncStatus]) -> None:
+        self.master.config(cursor="watch")
+        self.master.update()
+        total_copied = 0
+        all_errors: list[str] = []
+        try:
+            for v in visits:
+                copied, errors = sync_visit(v)
+                total_copied += copied
+                all_errors.extend(errors)
+                if not errors:
+                    v.remote_files = v.remote_files | v.local_files
+        finally:
+            self.master.config(cursor="")
+
+        self._sync_refresh_tree()
+
+        summary = f"Copied {total_copied} file(s) across {len(visits)} visit(s)."
+        if all_errors:
+            summary += f"\n\nErrors ({len(all_errors)}):\n" + "\n".join(all_errors[:20])
+            messagebox.showwarning("Sync complete (with errors)", summary, parent=self.master)
+        else:
+            messagebox.showinfo("Sync complete", summary, parent=self.master)
+
 
 # ---------------------------------------------------------------------------
 # Discharge group management dialog
@@ -359,17 +575,14 @@ class DischargeGroupDialog(tk.Toplevel):
 
         self._groups: list[DischargeGroup] = copy.deepcopy(existing_groups)
         self._next_number: int = max((g.number for g in self._groups), default=0) + 1
-
-        assigned = {fp for g in self._groups for fp in g.files}
-        self._unassigned: list[str] = [fp for fp in discharge_files if fp not in assigned]
+        self._all_files: list[str] = list(discharge_files)  # always shows all files
 
         self.result: list[DischargeGroup] | None = None
-        self._item_to_path: dict[str, str] = {}  # treeview iid -> absolute path
+        self._item_to_path: dict[str, str] = {}
 
         self._build_ui()
         self._refresh()
 
-        # Center on parent
         self.update_idletasks()
         x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
         y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
@@ -382,7 +595,6 @@ class DischargeGroupDialog(tk.Toplevel):
         main.columnconfigure(2, weight=3)
         main.rowconfigure(0, weight=1)
 
-        # Left: groups treeview
         left = tk.LabelFrame(main, text="Measurement Groups")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
 
@@ -393,38 +605,35 @@ class DischargeGroupDialog(tk.Toplevel):
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self._tree.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-        # Middle: action buttons
         mid = tk.Frame(main)
         mid.grid(row=0, column=1, padx=6)
-        tk.Frame(mid).pack(expand=True)  # spacer
+        tk.Frame(mid).pack(expand=True)
         tk.Button(mid, text="New Group...", width=16, command=self._new_group).pack(pady=3)
         tk.Button(mid, text="Delete Group", width=16, command=self._delete_group).pack(pady=3)
         ttk.Separator(mid, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
-        tk.Button(mid, text="← Assign Files", width=16, command=self._assign_to_group).pack(pady=3)
-        tk.Button(mid, text="Unassign →", width=16, command=self._unassign_file).pack(pady=3)
-        tk.Frame(mid).pack(expand=True)  # spacer
+        tk.Button(mid, text="← Add to Group", width=16, command=self._assign_to_group).pack(pady=3)
+        tk.Button(mid, text="Remove from Group", width=16, command=self._unassign_file).pack(pady=3)
+        tk.Frame(mid).pack(expand=True)
 
-        # Right: unassigned files listbox
-        right = tk.LabelFrame(main, text="Unassigned Discharge Files")
+        right = tk.LabelFrame(main, text="Discharge Files")
         right.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
 
         vsb2 = tk.Scrollbar(right, orient=tk.VERTICAL)
-        self._unassigned_lb = tk.Listbox(
+        self._all_files_lb = tk.Listbox(
             right, yscrollcommand=vsb2.set, selectmode=tk.EXTENDED, font=("Courier", 9),
             exportselection=False,
         )
-        vsb2.config(command=self._unassigned_lb.yview)
+        vsb2.config(command=self._all_files_lb.yview)
         vsb2.pack(side=tk.RIGHT, fill=tk.Y)
-        self._unassigned_lb.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self._all_files_lb.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
-        # Bottom: OK / Cancel
         bottom = tk.Frame(self, pady=6)
         bottom.pack(fill=tk.X, padx=8)
         tk.Button(bottom, text="Cancel", width=10, command=self.destroy).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
         tk.Button(
-            bottom, text="OK", width=10, bg="#2e7d32", fg="white", command=self._ok
+            bottom, text="OK", width=10, command=self._ok
         ).pack(side=tk.RIGHT)
 
     def _refresh(self) -> None:
@@ -436,12 +645,19 @@ class DischargeGroupDialog(tk.Toplevel):
                 fid = self._tree.insert(gid, tk.END, text=Path(fp).name, tags=("file",))
                 self._item_to_path[fid] = fp
 
-        self._unassigned_lb.delete(0, tk.END)
-        for fp in self._unassigned:
-            self._unassigned_lb.insert(tk.END, Path(fp).name)
+        # Count how many groups each file is assigned to
+        group_count: dict[str, int] = {}
+        for g in self._groups:
+            for fp in g.files:
+                group_count[fp] = group_count.get(fp, 0) + 1
+
+        self._all_files_lb.delete(0, tk.END)
+        for fp in self._all_files:
+            count = group_count.get(fp, 0)
+            suffix = f"  [{count} group{'s' if count != 1 else ''}]" if count else ""
+            self._all_files_lb.insert(tk.END, Path(fp).name + suffix)
 
     def _selected_group(self) -> DischargeGroup | None:
-        """Return the DischargeGroup for the currently selected tree item (group or file)."""
         sel = self._tree.selection()
         if not sel:
             return None
@@ -458,18 +674,14 @@ class DischargeGroupDialog(tk.Toplevel):
             return
         time_val, type_val = dlg.result
 
-        selected_indices = sorted(self._unassigned_lb.curselection())
-        selected_files = [self._unassigned[i] for i in selected_indices]
+        selected_indices = self._all_files_lb.curselection()
+        selected_files = [self._all_files[i] for i in selected_indices]
 
         g = DischargeGroup(
             number=self._next_number, time=time_val, type=type_val, files=selected_files
         )
         self._next_number += 1
         self._groups.append(g)
-
-        for i in reversed(selected_indices):
-            self._unassigned.pop(i)
-
         self._refresh()
 
     def _delete_group(self) -> None:
@@ -477,7 +689,6 @@ class DischargeGroupDialog(tk.Toplevel):
         if group is None:
             messagebox.showwarning("No group selected", "Select a group to delete.", parent=self)
             return
-        self._unassigned.extend(group.files)
         self._groups.remove(group)
         self._refresh()
 
@@ -488,16 +699,16 @@ class DischargeGroupDialog(tk.Toplevel):
                 "No group selected", "Select a group in the left panel.", parent=self
             )
             return
-        selected_indices = sorted(self._unassigned_lb.curselection())
+        selected_indices = self._all_files_lb.curselection()
         if not selected_indices:
             messagebox.showwarning(
-                "No files selected", "Select files from the right panel to assign.", parent=self
+                "No files selected", "Select files from the right panel to add.", parent=self
             )
             return
-        selected_files = [self._unassigned[i] for i in selected_indices]
-        group.files.extend(selected_files)
-        for i in reversed(selected_indices):
-            self._unassigned.pop(i)
+        for i in selected_indices:
+            fp = self._all_files[i]
+            if fp not in group.files:
+                group.files.append(fp)
         self._refresh()
 
     def _unassign_file(self) -> None:
@@ -507,14 +718,13 @@ class DischargeGroupDialog(tk.Toplevel):
         item = sel[0]
         if item not in self._item_to_path:
             messagebox.showwarning(
-                "Select a file", "Select a file inside a group to unassign it.", parent=self
+                "Select a file", "Select a file inside a group to remove it.", parent=self
             )
             return
         fp = self._item_to_path[item]
         group = self._selected_group()
         if group and fp in group.files:
             group.files.remove(fp)
-            self._unassigned.append(fp)
         self._refresh()
 
     def _ok(self) -> None:
@@ -563,4 +773,159 @@ class _GroupPropertiesDialog(tk.Toplevel):
             )
             return
         self.result = (t, self._type_var.get())
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Routing config dialog
+# ---------------------------------------------------------------------------
+
+# Internal IDs for the four editable routing sections shown in the treeview
+_ROUTING_SECTIONS = [
+    ("Discharge",      "Discharge",                   "extensions"),
+    ("Discharge_qrev", "Discharge (requires _QRev suffix)", "qrev_extensions"),
+    ("Photos",         "Photos",                      "extensions"),
+    ("RawData",        "RawData",                     "extensions"),
+]
+
+
+class RoutingConfigDialog(tk.Toplevel):
+    """Dialog for viewing and editing routing.json without touching any .py files."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Routing Configuration")
+        self.grab_set()
+        self.transient(parent)
+        self.resizable(True, True)
+        self.minsize(420, 380)
+        self.saved = False
+
+        self._routing = load_routing()
+        self._build_ui()
+        self._populate_tree()
+
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_width()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{x}+{y}")
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        main = tk.Frame(self, padx=8, pady=8)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # Treeview
+        tree_frame = tk.LabelFrame(main, text="Folder  →  Extensions")
+        tree_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        vsb = tk.Scrollbar(tree_frame, orient=tk.VERTICAL)
+        self._tree = ttk.Treeview(
+            tree_frame, yscrollcommand=vsb.set, selectmode="browse", show="tree"
+        )
+        vsb.config(command=self._tree.yview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._tree.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+        # Add extension row
+        add_frame = tk.Frame(main)
+        add_frame.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(add_frame, text="Extension:").pack(side=tk.LEFT)
+        self._ext_var = tk.StringVar()
+        tk.Entry(add_frame, textvariable=self._ext_var, width=10).pack(
+            side=tk.LEFT, padx=6
+        )
+        tk.Button(add_frame, text="Add to selected folder", command=self._add_ext).pack(
+            side=tk.LEFT
+        )
+
+        # Bottom buttons
+        btn_frame = tk.Frame(main)
+        btn_frame.pack(fill=tk.X)
+        tk.Button(btn_frame, text="Remove Selected", width=16, command=self._remove_ext).pack(
+            side=tk.LEFT
+        )
+        tk.Button(btn_frame, text="Cancel", width=10, command=self.destroy).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
+        tk.Button(btn_frame, text="Save", width=10, command=self._save).pack(side=tk.RIGHT)
+
+    # ------------------------------------------------------------------
+    # Tree management
+    # ------------------------------------------------------------------
+
+    def _populate_tree(self) -> None:
+        self._tree.delete(*self._tree.get_children())
+        for iid, label, key in _ROUTING_SECTIONS:
+            folder_key = "Discharge" if "Discharge" in iid else iid
+            exts = self._routing.get(folder_key, {}).get(key, [])
+            parent = self._tree.insert(
+                "", tk.END, iid=iid, text=f"  {label}", open=True, tags=("folder",)
+            )
+            for ext in sorted(exts):
+                self._tree.insert(parent, tk.END, text=f"    {ext}", tags=("ext",))
+        self._tree.tag_configure("folder", font=("TkDefaultFont", 9, "bold"))
+
+    def _section_for_item(self, iid: str) -> tuple[str, str, str] | None:
+        """Return the _ROUTING_SECTIONS entry for a tree item (folder or child ext)."""
+        parent = self._tree.parent(iid)
+        section_iid = parent if parent else iid
+        return next((s for s in _ROUTING_SECTIONS if s[0] == section_iid), None)
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    def _add_ext(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            messagebox.showwarning(
+                "No folder selected", "Select a folder (or extension within one) first.", parent=self
+            )
+            return
+        section = self._section_for_item(sel[0])
+        if section is None:
+            return
+        _, _, key = section
+        folder_key = "Discharge" if "Discharge" in section[0] else section[0]
+
+        raw = self._ext_var.get().strip().lower()
+        if not raw:
+            return
+        ext = raw if raw.startswith(".") else f".{raw}"
+
+        exts: list = self._routing.setdefault(folder_key, {}).setdefault(key, [])
+        if ext not in exts:
+            exts.append(ext)
+            self._populate_tree()
+        self._ext_var.set("")
+
+    def _remove_ext(self) -> None:
+        sel = self._tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        if "ext" not in self._tree.item(iid, "tags"):
+            messagebox.showwarning(
+                "Select an extension", "Select an individual extension to remove.", parent=self
+            )
+            return
+        section = self._section_for_item(iid)
+        if section is None:
+            return
+        _, _, key = section
+        folder_key = "Discharge" if "Discharge" in section[0] else section[0]
+
+        ext_text = self._tree.item(iid, "text").strip()
+        exts: list = self._routing.get(folder_key, {}).get(key, [])
+        if ext_text in exts:
+            exts.remove(ext_text)
+            self._populate_tree()
+
+    def _save(self) -> None:
+        save_routing(self._routing)
+        self.saved = True
         self.destroy()
