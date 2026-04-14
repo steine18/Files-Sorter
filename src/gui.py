@@ -668,14 +668,15 @@ class DischargeGroupDialog(tk.Toplevel):
         return next((g for g in self._groups if g.folder_name == folder_name), None)
 
     def _new_group(self) -> None:
+        # Capture selection before the sub-dialog opens — focus changes can clear it
+        selected_indices = list(self._all_files_lb.curselection())
+        selected_files = [self._all_files[i] for i in selected_indices]
+
         dlg = _GroupPropertiesDialog(self)
         self.wait_window(dlg)
         if dlg.result is None:
             return
         time_val, type_val = dlg.result
-
-        selected_indices = self._all_files_lb.curselection()
-        selected_files = [self._all_files[i] for i in selected_indices]
 
         g = DischargeGroup(
             number=self._next_number, time=time_val, type=type_val, files=selected_files
