@@ -162,31 +162,31 @@ def sort_files(
     site_number, date_str = parse_primary_xml(primary.name)
     output_dir = Path(output_base_dir) / site_number / f"SV_{date_str}"
 
-    # Build discharge routing: absolute path string -> list of subfolders within Discharge/
-    # A file may be assigned to more than one group and will be copied to each.
-    discharge_map: dict[str, list[str]] = {}
+    # Build discharge routing using Path objects as keys so separators are
+    # normalised consistently on all platforms (avoids forward/back-slash mismatch).
+    discharge_map: dict[Path, list[str]] = {}
     if discharge_groups:
         for g in discharge_groups:
             for fp in g.files:
-                discharge_map.setdefault(str(fp), []).append(g.folder_name)
+                discharge_map.setdefault(Path(fp), []).append(g.folder_name)
 
-    print(f"[DEBUG] discharge_groups received: {len(discharge_groups) if discharge_groups else 0} group(s)")
-    if discharge_groups:
-        for g in discharge_groups:
-            print(f"[DEBUG]   {g.folder_name}: {len(g.files)} file(s) → {[Path(f).name for f in g.files]}")
-    print(f"[DEBUG] discharge_map keys: {[Path(k).name for k in discharge_map]}")
+    # Normalise overrides keys the same way
+    overrides_map: dict[Path, str] = {}
+    if overrides:
+        for k, v in overrides.items():
+            overrides_map[Path(k)] = v
 
     routed: dict[str, list[str]] = {}
     errors: list[tuple[str, str]] = []
 
     for p in paths:
         # Manual override takes priority over automatic routing
-        if overrides and str(p) in overrides:
-            folder = overrides[str(p)]
+        if p in overrides_map:
+            folder = overrides_map[p]
         else:
             folder = route_file(p.name)
-        if folder == "Discharge" and str(p) in discharge_map:
-            for subfolder in discharge_map[str(p)]:
+        if folder == "Discharge" and p in discharge_map:
+            for subfolder in discharge_map[p]:
                 dest_dir = output_dir / "Discharge" / subfolder
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 try:
