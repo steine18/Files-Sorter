@@ -170,6 +170,12 @@ def sort_files(
             for fp in g.files:
                 discharge_map.setdefault(str(fp), []).append(g.folder_name)
 
+    print(f"[DEBUG] discharge_groups received: {len(discharge_groups) if discharge_groups else 0} group(s)")
+    if discharge_groups:
+        for g in discharge_groups:
+            print(f"[DEBUG]   {g.folder_name}: {len(g.files)} file(s) → {[Path(f).name for f in g.files]}")
+    print(f"[DEBUG] discharge_map keys: {[Path(k).name for k in discharge_map]}")
+
     routed: dict[str, list[str]] = {}
     errors: list[tuple[str, str]] = []
 
