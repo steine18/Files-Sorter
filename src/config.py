@@ -1,8 +1,14 @@
 import json
 import os
+import sys
 from pathlib import Path
 
-CONFIG_PATH = Path(__file__).parent.parent / "config.json"
+# When frozen by PyInstaller, store config next to the executable so it
+# persists across updates. In development, use the project root.
+if getattr(sys, "frozen", False):
+    CONFIG_PATH = Path(sys.executable).parent / "config.json"
+else:
+    CONFIG_PATH = Path(__file__).parent.parent / "config.json"
 _DEFAULTS = {"output_dir": str(Path.home())}
 
 

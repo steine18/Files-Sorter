@@ -9,5 +9,9 @@ __pycache__/
 *.py[cod]
 .venv/
 
+# PyInstaller output
+dist/
+build/
+
 # Config (contains local paths)
 config.json

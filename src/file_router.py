@@ -1,6 +1,7 @@
 import json
 import re
 import shutil
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,7 +19,12 @@ _VELOCITY_TYPE_MAP = {
 # Regex for the primary visit XML: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml
 _PRIMARY_XML_RE = re.compile(r"^SV_.+_(\d{8})_\d{6}\.xml$", re.IGNORECASE)
 
-ROUTING_PATH = Path(__file__).parent.parent / "routing.json"
+# When frozen by PyInstaller, routing.json lives next to the executable so
+# users can edit it. In development, use the project root.
+if getattr(sys, "frozen", False):
+    ROUTING_PATH = Path(sys.executable).parent / "routing.json"
+else:
+    ROUTING_PATH = Path(__file__).parent.parent / "routing.json"
 
 _ROUTING_DEFAULTS: dict = {
     "Discharge": {
