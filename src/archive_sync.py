@@ -99,8 +99,14 @@ def populate_remote(visits: list[VisitSyncStatus], dst_root: str) -> None:
         v.remote_files = _collect_relative_files(v.remote_dir)
 
 
-def sync_visit(visit: VisitSyncStatus) -> tuple[int, list[str]]:
+def sync_visit(
+    visit: VisitSyncStatus,
+    on_file=None,
+) -> tuple[int, list[str]]:
     """Copy files missing from remote to the remote visit directory.
+
+    on_file(rel_path: str) is called after each successful copy, useful
+    for progress reporting.
 
     Returns (number_copied, list_of_error_strings).
     """
@@ -113,6 +119,8 @@ def sync_visit(visit: VisitSyncStatus) -> tuple[int, list[str]]:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             copied += 1
+            if on_file:
+                on_file(rel)
         except OSError as exc:
             errors.append(f"{rel}: {exc}")
     return copied, errors

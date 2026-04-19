@@ -1,5 +1,7 @@
 import copy
+import queue
 import re
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -202,22 +204,39 @@ class App(tk.Frame):
         for tag, color in _SYNC_STATUS_COLORS.items():
             self._sync_tree.tag_configure(tag, background=color)
 
+        # --- Progress bar (hidden until a sync is running) ---
+        self._sync_progress_frame = tk.Frame(parent)
+        self._sync_progress_frame.pack(fill=tk.X, padx=8, pady=(0, 2))
+
+        self._sync_status_var = tk.StringVar(value="")
+        tk.Label(
+            self._sync_progress_frame, textvariable=self._sync_status_var, anchor="w"
+        ).pack(fill=tk.X)
+        self._sync_progress_var = tk.IntVar(value=0)
+        self._sync_progressbar = ttk.Progressbar(
+            self._sync_progress_frame,
+            variable=self._sync_progress_var,
+            mode="determinate",
+        )
+        self._sync_progressbar.pack(fill=tk.X, pady=(2, 0))
+        self._sync_progress_frame.pack_forget()  # hidden by default
+
         # --- Buttons ---
         btn_frame = tk.Frame(parent)
         btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
 
-        tk.Button(btn_frame, text="Scan", width=10, command=self._sync_scan).pack(
-            side=tk.LEFT, padx=(0, 4)
+        self._sync_btn_scan = tk.Button(
+            btn_frame, text="Scan", width=10, command=self._sync_scan
         )
-        tk.Button(btn_frame, text="Sync Selected", width=14, command=self._sync_selected).pack(
-            side=tk.LEFT, padx=(0, 4)
+        self._sync_btn_scan.pack(side=tk.LEFT, padx=(0, 4))
+        self._sync_btn_selected = tk.Button(
+            btn_frame, text="Sync Selected", width=14, command=self._sync_selected
         )
-        tk.Button(
-            btn_frame,
-            text="Sync All",
-            width=10,
-            command=self._sync_all,
-        ).pack(side=tk.LEFT)
+        self._sync_btn_selected.pack(side=tk.LEFT, padx=(0, 4))
+        self._sync_btn_all = tk.Button(
+            btn_frame, text="Sync All", width=10, command=self._sync_all
+        )
+        self._sync_btn_all.pack(side=tk.LEFT)
 
     # ------------------------------------------------------------------
     # Sort tab — event handlers
@@ -462,23 +481,68 @@ class App(tk.Frame):
         self._run_sync(to_sync)
 
     def _run_sync(self, visits: list[VisitSyncStatus]) -> None:
-        self.master.config(cursor="watch")
-        self.master.update()
-        total_copied = 0
-        all_errors: list[str] = []
-        try:
+        total_files = sum(len(v.missing_on_remote) for v in visits)
+
+        # Show and reset the progress bar
+        self._sync_progress_var.set(0)
+        self._sync_progressbar.configure(maximum=max(total_files, 1))
+        self._sync_status_var.set(f"Copying 0 / {total_files} files...")
+        self._sync_progress_frame.pack(fill=tk.X, padx=8, pady=(0, 2),
+                                       before=self._sync_btn_scan.master)
+
+        # Disable sync buttons while running
+        for btn in (self._sync_btn_scan, self._sync_btn_selected, self._sync_btn_all):
+            btn.configure(state=tk.DISABLED)
+
+        q: queue.Queue = queue.Queue()
+        files_done = [0]  # mutable counter shared with worker
+
+        def worker():
+            total_copied = 0
+            all_errors: list[str] = []
             for v in visits:
-                copied, errors = sync_visit(v)
+                def on_file(rel, _v=v):
+                    files_done[0] += 1
+                    q.put(("progress", files_done[0], Path(rel).name, _v.site_id))
+
+                copied, errors = sync_visit(v, on_file=on_file)
                 total_copied += copied
                 all_errors.extend(errors)
                 if not errors:
                     v.remote_files = v.remote_files | v.local_files
-        finally:
-            self.master.config(cursor="")
+            q.put(("done", total_copied, all_errors))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_sync(q, total_files)
+
+    def _poll_sync(self, q: queue.Queue, total_files: int) -> None:
+        try:
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "progress":
+                    _, done, filename, site_id = msg
+                    self._sync_progress_var.set(done)
+                    self._sync_status_var.set(
+                        f"Copying {done} / {total_files} files...  {site_id}: {filename}"
+                    )
+                elif msg[0] == "done":
+                    _, total_copied, all_errors = msg
+                    self._finish_sync(total_copied, all_errors)
+                    return
+        except queue.Empty:
+            pass
+        self.master.after(50, lambda: self._poll_sync(q, total_files))
+
+    def _finish_sync(self, total_copied: int, all_errors: list[str]) -> None:
+        # Hide progress bar and re-enable buttons
+        self._sync_progress_frame.pack_forget()
+        self._sync_status_var.set("")
+        for btn in (self._sync_btn_scan, self._sync_btn_selected, self._sync_btn_all):
+            btn.configure(state=tk.NORMAL)
 
         self._sync_refresh_tree()
 
-        summary = f"Copied {total_copied} file(s) across {len(visits)} visit(s)."
+        summary = f"Copied {total_copied} file(s)."
         if all_errors:
             summary += f"\n\nErrors ({len(all_errors)}):\n" + "\n".join(all_errors[:20])
             messagebox.showwarning("Sync complete (with errors)", summary, parent=self.master)
