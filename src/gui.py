@@ -1,5 +1,7 @@
 import copy
+import queue
 import re
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
@@ -69,9 +71,10 @@ class App(tk.Frame):
             anchor="w",
             width=48,
         ).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
-        tk.Button(out_frame, text="Change Folder", command=self._change_output_folder).pack(
-            side=tk.LEFT
+        self._out_btn_change = tk.Button(
+            out_frame, text="Change Folder", command=self._change_output_folder
         )
+        self._out_btn_change.pack(side=tk.LEFT)
 
         # --- Notebook ---
         self._notebook = ttk.Notebook(self)
@@ -175,7 +178,10 @@ class App(tk.Frame):
             anchor="w",
             width=48,
         ).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
-        tk.Button(dst_frame, text="Browse...", command=self._sync_browse_dst).pack(side=tk.LEFT)
+        self._sync_btn_browse = tk.Button(
+            dst_frame, text="Browse...", command=self._sync_browse_dst
+        )
+        self._sync_btn_browse.pack(side=tk.LEFT)
 
         # --- Treeview ---
         tree_frame = tk.LabelFrame(parent, text="Local site visits")
@@ -217,31 +223,50 @@ class App(tk.Frame):
             side=tk.LEFT, fill=tk.X, expand=True
         )
         self._show_synced_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(
+        self._show_synced_chk = tk.Checkbutton(
             info_frame, text="Show synced", variable=self._show_synced_var,
             command=self._sync_refresh_tree,
-        ).pack(side=tk.RIGHT)
+        )
+        self._show_synced_chk.pack(side=tk.RIGHT)
+
+        # --- Progress bar (hidden until a sync is running) ---
+        self._sync_progress_frame = tk.Frame(parent)
+        self._sync_progress_frame.pack(fill=tk.X, padx=8, pady=(0, 2))
+
+        self._sync_status_var = tk.StringVar(value="")
+        tk.Label(
+            self._sync_progress_frame, textvariable=self._sync_status_var, anchor="w"
+        ).pack(fill=tk.X)
+        self._sync_progress_var = tk.IntVar(value=0)
+        self._sync_progressbar = ttk.Progressbar(
+            self._sync_progress_frame,
+            variable=self._sync_progress_var,
+            mode="determinate",
+        )
+        self._sync_progressbar.pack(fill=tk.X, pady=(2, 0))
+        self._sync_progress_frame.pack_forget()  # hidden by default
 
         # --- Buttons ---
         btn_frame = tk.Frame(parent)
         btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
 
-        tk.Button(btn_frame, text="Scan", width=10, command=self._sync_scan).pack(
-            side=tk.LEFT, padx=(0, 4)
+        self._sync_btn_scan = tk.Button(
+            btn_frame, text="Scan", width=10, command=self._sync_scan
         )
-        tk.Button(
+        self._sync_btn_scan.pack(side=tk.LEFT, padx=(0, 4))
+        self._sync_btn_full = tk.Button(
             btn_frame, text="Full Rescan", width=12,
             command=lambda: self._sync_scan(full=True),
-        ).pack(side=tk.LEFT, padx=(0, 4))
-        tk.Button(btn_frame, text="Sync Selected", width=14, command=self._sync_selected).pack(
-            side=tk.LEFT, padx=(0, 4)
         )
-        tk.Button(
-            btn_frame,
-            text="Sync All",
-            width=10,
-            command=self._sync_all,
-        ).pack(side=tk.LEFT)
+        self._sync_btn_full.pack(side=tk.LEFT, padx=(0, 4))
+        self._sync_btn_selected = tk.Button(
+            btn_frame, text="Sync Selected", width=14, command=self._sync_selected
+        )
+        self._sync_btn_selected.pack(side=tk.LEFT, padx=(0, 4))
+        self._sync_btn_all = tk.Button(
+            btn_frame, text="Sync All", width=10, command=self._sync_all
+        )
+        self._sync_btn_all.pack(side=tk.LEFT)
 
     # ------------------------------------------------------------------
     # Sort tab — event handlers
@@ -609,18 +634,79 @@ class App(tk.Frame):
             return
         self._run_sync(to_sync)
 
+    def _set_sync_busy(self, busy: bool) -> None:
+        """Disable every control that reads or replaces self._visits while the background
+        sync thread is updating it (scanning, syncing, redrawing the list, or changing
+        either folder, which would discard the visits mid-copy)."""
+        state = tk.DISABLED if busy else tk.NORMAL
+        for widget in (
+            self._sync_btn_scan, self._sync_btn_full, self._sync_btn_selected,
+            self._sync_btn_all, self._show_synced_chk, self._sync_btn_browse,
+            self._out_btn_change,
+        ):
+            widget.configure(state=state)
+
     def _run_sync(self, visits: list[VisitSyncStatus]) -> None:
-        self.master.config(cursor="watch")
-        self.master.update()
-        total_copied = 0
-        all_errors: list[str] = []
+        total_files = sum(len(v.to_copy) for v in visits)
+
+        # Show and reset the progress bar
+        self._sync_progress_var.set(0)
+        self._sync_progressbar.configure(maximum=max(total_files, 1))
+        self._sync_status_var.set(f"Copying 0 / {total_files} files...")
+        self._sync_progress_frame.pack(fill=tk.X, padx=8, pady=(0, 2),
+                                       before=self._sync_btn_scan.master)
+        self._set_sync_busy(True)
+
+        q: queue.Queue = queue.Queue()
+        files_done = [0]  # only touched by the worker thread
+
+        def worker():
+            total_copied = 0
+            all_errors: list[str] = []
+            try:
+                for v in visits:
+                    def on_file(rel, _v=v):
+                        files_done[0] += 1
+                        q.put(("progress", files_done[0], Path(rel).name, _v.site_id))
+
+                    # sync_visit keeps v's remote state up to date, file by file
+                    copied, errors = sync_visit(v, on_file=on_file)
+                    total_copied += copied
+                    all_errors.extend(errors)
+            except Exception as exc:  # never leave the UI stuck in the busy state
+                all_errors.append(f"Sync stopped unexpectedly: {exc}")
+            q.put(("done", total_copied, all_errors))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_sync(q, total_files, visits)
+
+    def _poll_sync(
+        self, q: queue.Queue, total_files: int, visits: list[VisitSyncStatus]
+    ) -> None:
         try:
-            for v in visits:
-                copied, errors = sync_visit(v)
-                total_copied += copied
-                all_errors.extend(errors)  # sync_visit keeps v's remote state up to date
-        finally:
-            self.master.config(cursor="")
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "progress":
+                    _, done, filename, site_id = msg
+                    self._sync_progress_var.set(done)
+                    self._sync_status_var.set(
+                        f"Copying {done} / {total_files} files...  {site_id}: {filename}"
+                    )
+                elif msg[0] == "done":
+                    _, total_copied, all_errors = msg
+                    self._finish_sync(visits, total_copied, all_errors)
+                    return
+        except queue.Empty:
+            pass
+        self.master.after(50, lambda: self._poll_sync(q, total_files, visits))
+
+    def _finish_sync(
+        self, visits: list[VisitSyncStatus], total_copied: int, all_errors: list[str]
+    ) -> None:
+        # Hide progress bar and re-enable controls
+        self._sync_progress_frame.pack_forget()
+        self._sync_status_var.set("")
+        self._set_sync_busy(False)
 
         # Visits that are now fully synced go in the log, so the next scan skips them.
         self._sync_log.update_from(visits, self._scanned_dst_root)
@@ -634,6 +720,7 @@ class App(tk.Frame):
             messagebox.showwarning("Sync complete (with errors)", summary, parent=self.master)
         else:
             messagebox.showinfo("Sync complete", summary, parent=self.master)
+
 
 
 # ---------------------------------------------------------------------------

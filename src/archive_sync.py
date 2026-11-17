@@ -230,11 +230,18 @@ def populate_remote(
         }
 
 
-def sync_visit(visit: VisitSyncStatus) -> tuple[int, list[str]]:
+def sync_visit(
+    visit: VisitSyncStatus,
+    on_file=None,
+) -> tuple[int, list[str]]:
     """Copy files missing from (or outdated on) the remote visit directory.
 
     Updates visit.remote_files / visit.outdated_on_remote for every file copied, so the
     status stays accurate even when some copies fail.
+
+    on_file(rel_path: str) is called after each file is attempted (copied or failed),
+    so a progress bar sized to len(visit.to_copy) always reaches the end.
+
     Returns (number_copied, list_of_error_strings).
     """
     copied = 0
@@ -250,4 +257,6 @@ def sync_visit(visit: VisitSyncStatus) -> tuple[int, list[str]]:
             visit.outdated_on_remote.discard(rel)
         except OSError as exc:
             errors.append(f"{rel}: {exc}")
+        if on_file:
+            on_file(rel)
     return copied, errors
