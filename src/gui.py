@@ -9,8 +9,8 @@ from tkinterdnd2 import DND_FILES, TkinterDnD
 from src.archive_sync import VisitSyncStatus, populate_remote, scan_local_visits, sync_visit
 from src.config import load_config, save_config
 from src.file_router import (
-    DischargeGroup, load_routing, parse_discharge_groups, parse_primary_xml,
-    reload_routing_cache, route_file, save_routing, sort_files,
+    DischargeGroup, find_primary_xmls, load_routing, parse_discharge_groups,
+    parse_primary_xml, reload_routing_cache, route_file, save_routing, sort_files,
 )
 
 # Column widths for the sort file list
@@ -230,27 +230,13 @@ class App(tk.Frame):
         paths = self._parse_drop_data(event.data)
         self._add_paths(paths)
 
-    @staticmethod
-    def _parse_drop_data(raw: str) -> list[str]:
-        """Parse the tkinterdnd2 drop string (handles brace-quoted paths with spaces)."""
-        paths: list[str] = []
-        raw = raw.strip()
-        i = 0
-        while i < len(raw):
-            if raw[i] == "{":
-                end = raw.index("}", i)
-                paths.append(raw[i + 1 : end])
-                i = end + 1
-            else:
-                end = raw.find(" ", i)
-                if end == -1:
-                    paths.append(raw[i:])
-                    break
-                paths.append(raw[i:end])
-                i = end
-            while i < len(raw) and raw[i] == " ":
-                i += 1
-        return [p for p in paths if p]
+    def _parse_drop_data(self, raw: str) -> list[str]:
+        """Parse the tkinterdnd2 drop string, which is a Tcl list (brace-quoted paths
+        with spaces, backslash escapes). Tk's own list parser handles every case."""
+        try:
+            return [p for p in self.tk.splitlist(raw) if p]
+        except tk.TclError:
+            return []
 
     def _add_files(self) -> None:
         paths = filedialog.askopenfilenames(title="Select files to sort")
@@ -270,12 +256,9 @@ class App(tk.Frame):
         """If no discharge groups exist yet, parse the primary XML and pre-populate them."""
         if self._discharge_groups:
             return
-        primary = next(
-            (p for p in self._file_paths if parse_primary_xml(Path(p).name) is not None),
-            None,
-        )
-        if primary:
-            self._discharge_groups = parse_discharge_groups(primary)
+        primaries = find_primary_xmls(self._file_paths)
+        if primaries:
+            self._discharge_groups = parse_discharge_groups(primaries[0])
 
     def _clear(self) -> None:
         self._file_paths.clear()
@@ -293,7 +276,18 @@ class App(tk.Frame):
         if folder:
             self._config["output_dir"] = folder
             self._out_var.set(folder)
+            self._save_config()
+            self._sync_invalidate()  # previous scan was of the old output folder
+
+    def _save_config(self) -> None:
+        try:
             save_config(self._config)
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not save settings",
+                f"The setting is applied for this session but could not be saved:\n{exc}",
+                parent=self.master,
+            )
 
     def _manage_discharge(self) -> None:
         discharge_files = [p for p in self._file_paths if self._effective_route(p) == "Discharge"]
@@ -408,9 +402,6 @@ class App(tk.Frame):
 
     def _refresh_list(self) -> None:
         self._listbox.delete(0, tk.END)
-        primary_name = None
-        site_number = None
-        date_str = None
 
         # A file may be in multiple groups; track all assignments per path
         discharge_display: dict[str, list[str]] = {}
@@ -427,10 +418,6 @@ class App(tk.Frame):
                     folder = f"Discharge/{groups[0]}"
                 else:
                     folder = f"Discharge/ ({len(groups)} groups)"
-            parsed = parse_primary_xml(name)
-            if parsed is not None:
-                primary_name = name
-                site_number, date_str = parsed
 
             manual = path in self._route_overrides
             suffix = " [*]" if manual else ""
@@ -439,8 +426,19 @@ class App(tk.Frame):
             if manual:
                 self._listbox.itemconfigure(idx, fg="#0055aa")
 
-        if primary_name:
-            self._primary_var.set(f"Primary XML: {primary_name}")
+        # Same rule as sort_files(): the first primary XML determines the output dir.
+        primaries = find_primary_xmls(self._file_paths)
+        if primaries:
+            primary_name = Path(primaries[0]).name
+            site_number, date_str = parse_primary_xml(primary_name)
+            visits = {parse_primary_xml(Path(p).name) for p in primaries}
+            if len(visits) > 1:
+                note = f"   ⚠ {len(visits)} different visits added — sorting will refuse"
+            elif len(primaries) > 1:
+                note = f"   (+{len(primaries) - 1} more for the same visit)"
+            else:
+                note = ""
+            self._primary_var.set(f"Primary XML: {primary_name}{note}")
             self._outdir_var.set(f"Output dir:  {site_number}/SV_{date_str}")
         else:
             self._primary_var.set("Primary XML: (none detected)")
@@ -455,10 +453,18 @@ class App(tk.Frame):
             title="Select archive destination root (DST folder)",
             initialdir=self._dst_var.get() or "",
         )
-        if folder:
+        if folder and folder != self._dst_var.get():
             self._dst_var.set(folder)
             self._config["archive_dst_root"] = folder
-            save_config(self._config)
+            self._save_config()
+            # Scanned visits hold remote paths under the old root — discard them so a
+            # sync can't copy to the previous destination.
+            self._sync_invalidate()
+
+    def _sync_invalidate(self) -> None:
+        """Forget the last scan (its local/remote paths are no longer current)."""
+        self._visits = []
+        self._sync_tree.delete(*self._sync_tree.get_children())
 
     def _sync_scan(self) -> None:
         output_dir = self._config.get("output_dir", "")
@@ -477,10 +483,19 @@ class App(tk.Frame):
         self.master.config(cursor="watch")
         self.master.update()
         try:
-            self._visits = scan_local_visits(output_dir)
-            populate_remote(self._visits, dst_root)
+            visits = scan_local_visits(output_dir)
+            populate_remote(visits, dst_root)
+        except OSError as exc:
+            self._sync_invalidate()
+            messagebox.showerror(
+                "Scan failed",
+                f"Could not read the output folder or archive destination:\n{exc}",
+                parent=self.master,
+            )
+            return
         finally:
             self.master.config(cursor="")
+        self._visits = visits
 
         self._sync_refresh_tree()
         if not self._visits:
@@ -542,9 +557,7 @@ class App(tk.Frame):
             for v in visits:
                 copied, errors = sync_visit(v)
                 total_copied += copied
-                all_errors.extend(errors)
-                if not errors:
-                    v.remote_files = v.remote_files | v.local_files
+                all_errors.extend(errors)  # sync_visit keeps v's remote state up to date
         finally:
             self.master.config(cursor="")
 
@@ -674,6 +687,9 @@ class DischargeGroupDialog(tk.Toplevel):
 
         dlg = _GroupPropertiesDialog(self)
         self.wait_window(dlg)
+        # Destroying the sub-dialog releases its grab entirely; reclaim it so the main
+        # window stays blocked while this dialog is open.
+        self.grab_set()
         if dlg.result is None:
             return
         time_val, type_val = dlg.result
@@ -927,6 +943,13 @@ class RoutingConfigDialog(tk.Toplevel):
             self._populate_tree()
 
     def _save(self) -> None:
-        save_routing(self._routing)
+        try:
+            save_routing(self._routing)
+        except OSError as exc:
+            messagebox.showerror(
+                "Could not save routing", f"routing.json could not be written:\n{exc}",
+                parent=self,
+            )
+            return
         self.saved = True
         self.destroy()

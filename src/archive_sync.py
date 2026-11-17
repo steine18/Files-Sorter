@@ -5,6 +5,9 @@ from pathlib import Path
 
 _SV_DIR_RE = re.compile(r"^SV_(\d{8})$")
 
+# FAT/exFAT and some network shares store mtimes at 2-second resolution.
+_MTIME_TOLERANCE_S = 2.0
+
 
 def water_year(date_str: str) -> int:
     """Return the 2-digit US water year for a YYYYMMDD string.
@@ -35,6 +38,15 @@ def _collect_relative_files(root: Path) -> set[str]:
     return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
 
 
+def _is_outdated(local: Path, remote: Path) -> bool:
+    """True if the remote copy differs in size or is older than the local file."""
+    try:
+        ls, rs = local.stat(), remote.stat()
+    except OSError:
+        return False  # can't tell — don't force a copy
+    return ls.st_size != rs.st_size or ls.st_mtime > rs.st_mtime + _MTIME_TOLERANCE_S
+
+
 @dataclass
 class VisitSyncStatus:
     site_id: str
@@ -43,6 +55,8 @@ class VisitSyncStatus:
     remote_dir: Path
     local_files: set[str] = field(default_factory=set)
     remote_files: set[str] = field(default_factory=set)
+    # Files present on both sides whose remote copy is stale (filled by populate_remote)
+    outdated_on_remote: set[str] = field(default_factory=set)
 
     @property
     def status(self) -> str:
@@ -50,13 +64,18 @@ class VisitSyncStatus:
             return "synced"
         if not self.remote_files:
             return "missing"
-        if self.local_files <= self.remote_files:
+        if self.local_files <= self.remote_files and not self.outdated_on_remote:
             return "synced"
         return "partial"
 
     @property
     def missing_on_remote(self) -> set[str]:
         return self.local_files - self.remote_files
+
+    @property
+    def to_copy(self) -> set[str]:
+        """Files that sync_visit() will copy: missing or outdated on the remote."""
+        return self.missing_on_remote | self.outdated_on_remote
 
     @property
     def water_year_str(self) -> str:
@@ -68,6 +87,7 @@ def scan_local_visits(output_dir: str) -> list[VisitSyncStatus]:
 
     Returns a list of VisitSyncStatus with local_dir and local_files populated.
     remote_dir and remote_files are left empty; call populate_remote() to fill them.
+    Raises OSError if output_dir (or a folder inside it) cannot be read.
     """
     base = Path(output_dir)
     results: list[VisitSyncStatus] = []
@@ -93,26 +113,35 @@ def scan_local_visits(output_dir: str) -> list[VisitSyncStatus]:
 
 
 def populate_remote(visits: list[VisitSyncStatus], dst_root: str) -> None:
-    """Fill remote_dir and remote_files on each VisitSyncStatus."""
+    """Fill remote_dir, remote_files and outdated_on_remote on each VisitSyncStatus.
+    Raises OSError if the destination cannot be read."""
     for v in visits:
         v.remote_dir = remote_visit_path(dst_root, v.site_id, v.date_str)
         v.remote_files = _collect_relative_files(v.remote_dir)
+        v.outdated_on_remote = {
+            rel for rel in v.local_files & v.remote_files
+            if _is_outdated(v.local_dir / rel, v.remote_dir / rel)
+        }
 
 
 def sync_visit(visit: VisitSyncStatus) -> tuple[int, list[str]]:
-    """Copy files missing from remote to the remote visit directory.
+    """Copy files missing from (or outdated on) the remote visit directory.
 
+    Updates visit.remote_files / visit.outdated_on_remote for every file copied, so the
+    status stays accurate even when some copies fail.
     Returns (number_copied, list_of_error_strings).
     """
     copied = 0
     errors: list[str] = []
-    for rel in sorted(visit.missing_on_remote):
+    for rel in sorted(visit.to_copy):
         src = visit.local_dir / rel
         dst = visit.remote_dir / rel
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             copied += 1
+            visit.remote_files.add(rel)
+            visit.outdated_on_remote.discard(rel)
         except OSError as exc:
             errors.append(f"{rel}: {exc}")
     return copied, errors
