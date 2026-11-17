@@ -3,7 +3,10 @@ import re
 import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
+
+from src.config import BUNDLE_DIR, DATA_DIR
 
 _AQ_NS = "http://water.usgs.gov/XML/AQ"
 
@@ -18,7 +21,9 @@ _VELOCITY_TYPE_MAP = {
 # Regex for the primary visit XML: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml
 _PRIMARY_XML_RE = re.compile(r"^SV_.+_(\d{8})_\d{6}\.xml$", re.IGNORECASE)
 
-ROUTING_PATH = Path(__file__).parent.parent / "routing.json"
+# User-editable routing (saved by the Routing dialog) and the copy shipped with the app.
+ROUTING_PATH = DATA_DIR / "routing.json"
+_BUNDLED_ROUTING_PATH = BUNDLE_DIR / "routing.json"
 
 _ROUTING_DEFAULTS: dict = {
     "Discharge": {
@@ -32,18 +37,38 @@ _ROUTING_DEFAULTS: dict = {
 _routing_cache: dict | None = None
 
 
+def _is_valid_routing(data) -> bool:
+    """True if *data* has the shape route_file() expects: {folder: {key: [str, ...]}}."""
+    if not isinstance(data, dict):
+        return False
+    for section in data.values():
+        if not isinstance(section, dict):
+            return False
+        for exts in section.values():
+            if not isinstance(exts, list) or not all(isinstance(e, str) for e in exts):
+                return False
+    return True
+
+
 def load_routing() -> dict:
-    """Load routing.json, falling back to built-in defaults on any error."""
-    if ROUTING_PATH.exists():
+    """Load routing.json (user copy first, then the bundled copy), falling back to
+    built-in defaults if neither exists or is malformed."""
+    for path in (ROUTING_PATH, _BUNDLED_ROUTING_PATH):
+        if not path.exists():
+            continue
         try:
-            with ROUTING_PATH.open() as f:
-                return json.load(f)
+            with path.open() as f:
+                data = json.load(f)
         except (json.JSONDecodeError, OSError):
-            pass
+            continue
+        if _is_valid_routing(data):
+            return data
     return json.loads(json.dumps(_ROUTING_DEFAULTS))  # deep copy of defaults
 
 
 def save_routing(routing: dict) -> None:
+    """Write routing.json. Raises OSError if the file cannot be written."""
+    ROUTING_PATH.parent.mkdir(parents=True, exist_ok=True)
     with ROUTING_PATH.open("w") as f:
         json.dump(routing, f, indent=2)
 
@@ -91,6 +116,12 @@ def parse_primary_xml(filename: str) -> tuple[str, str] | None:
     return None
 
 
+def find_primary_xmls(file_paths) -> list[str]:
+    """Return every path in *file_paths* whose name matches the primary XML pattern,
+    in input order. The first one is the one used for sorting."""
+    return [p for p in file_paths if parse_primary_xml(Path(p).name) is not None]
+
+
 def route_file(filename: str) -> str:
     """Return the destination subfolder name for a single file."""
     name = Path(filename).name
@@ -109,7 +140,7 @@ def route_file(filename: str) -> str:
     qrev_exts = {e.lower() for e in discharge.get("qrev_extensions", [])}
     if ext in discharge_exts:
         return "Discharge"
-    if ext in qrev_exts and stem.endswith("_QRev"):
+    if ext in qrev_exts and stem.lower().endswith("_qrev"):
         return "Discharge"
 
     # 3. Photos, 4. RawData (order matches routing.json key order)
@@ -143,23 +174,30 @@ def sort_files(
             "errors": [(name, reason)],  # files that could not be processed
         }
 
-    Raises ValueError if no primary XML is found in file_paths.
+    Raises ValueError if no primary XML is found in file_paths, or if primary XMLs
+    for more than one site/date are present.
     """
     paths = [Path(p) for p in file_paths]
 
-    # Find the primary XML
-    primary = None
-    for p in paths:
-        if parse_primary_xml(p.name) is not None:
-            primary = p
-            break
-
-    if primary is None:
+    # Find the primary XML (the first one wins; all must agree on site and date)
+    primaries = [Path(p) for p in find_primary_xmls(file_paths)]
+    if not primaries:
         raise ValueError(
             "No primary visit XML found (expected filename: SV_{site}_{YYYYMMDD}_{HHMMSS}.xml)."
         )
-
+    primary = primaries[0]
     site_number, date_str = parse_primary_xml(primary.name)
+    conflicting = [
+        p.name for p in primaries[1:] if parse_primary_xml(p.name) != (site_number, date_str)
+    ]
+    if conflicting:
+        raise ValueError(
+            "Files from more than one site visit were added.\n"
+            f"Using: {primary.name}\n"
+            f"Conflicting: {', '.join(conflicting)}\n"
+            "Sort one visit at a time."
+        )
+
     output_dir = Path(output_base_dir) / site_number / f"SV_{date_str}"
 
     # Build discharge routing using Path objects as keys so separators are
@@ -178,6 +216,27 @@ def sort_files(
 
     routed: dict[str, list[str]] = {}
     errors: list[tuple[str, str]] = []
+    # Destination file (case-folded; Windows paths are case-insensitive) -> source that
+    # claimed it in this run. Prevents a same-named file silently overwriting another.
+    claimed: dict[str, Path] = {}
+
+    def copy_to(src: Path, folder_label: str) -> None:
+        dest = output_dir / folder_label / src.name
+        key = str(dest).casefold()
+        if key in claimed and claimed[key] != src:
+            errors.append((
+                src.name,
+                f"same filename as {claimed[key]} in {folder_label}/ - not copied "
+                "(rename one of them and sort again)",
+            ))
+            return
+        claimed[key] = src
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            routed.setdefault(folder_label, []).append(src.name)
+        except OSError as exc:
+            errors.append((src.name, str(exc)))
 
     for p in paths:
         # Manual override takes priority over automatic routing
@@ -187,21 +246,9 @@ def sort_files(
             folder = route_file(p.name)
         if folder == "Discharge" and p in discharge_map:
             for subfolder in discharge_map[p]:
-                dest_dir = output_dir / "Discharge" / subfolder
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    shutil.copy2(p, dest_dir / p.name)
-                    routed.setdefault(f"Discharge/{subfolder}", []).append(p.name)
-                except OSError as exc:
-                    errors.append((p.name, str(exc)))
+                copy_to(p, f"Discharge/{subfolder}")
         else:
-            dest_dir = output_dir / folder
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(p, dest_dir / p.name)
-                routed.setdefault(folder, []).append(p.name)
-            except OSError as exc:
-                errors.append((p.name, str(exc)))
+            copy_to(p, folder)
 
     return {
         "output_dir": str(output_dir),
@@ -231,10 +278,16 @@ def parse_discharge_groups(xml_path: str) -> list[DischargeGroup]:
         dt_el = dm.find(f"{{{_AQ_NS}}}DischargeDateTime")
         if dt_el is None or not dt_el.text:
             continue
+        dt_text = dt_el.text.strip()
+        if "T" not in dt_text:
+            continue  # date only — no time to name the folder with
         try:
-            # Format: "2026-04-09T09:56:30-07:00" → "095630"
-            time_str = dt_el.text.split("T")[1][:8].replace(":", "")
-        except IndexError:
+            # Format: "2026-04-09T09:56:30-07:00" → "095630" (missing seconds → 00).
+            # "Z" is only accepted by fromisoformat on Python 3.11+, so normalise it.
+            if dt_text.endswith(("Z", "z")):
+                dt_text = dt_text[:-1] + "+00:00"
+            time_str = datetime.fromisoformat(dt_text).strftime("%H%M%S")
+        except ValueError:
             continue
 
         # --- Determine type from method codes in first Channel ---
@@ -255,7 +308,7 @@ def parse_discharge_groups(xml_path: str) -> list[DischargeGroup]:
         else:
             # Fall back to velocity method code (distinguishes FT from AA)
             vel_el = channel.find(f"{{{_AQ_NS}}}VelocityMethodCode")
-            vel_code = (vel_el.text if vel_el is not None else "").strip()
+            vel_code = ((vel_el.text if vel_el is not None else None) or "").strip()
             mtype = _VELOCITY_TYPE_MAP.get(vel_code, "FT")
 
         groups.append(DischargeGroup(number=number, time=time_str, type=mtype))
