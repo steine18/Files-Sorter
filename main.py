@@ -19,7 +19,7 @@ def _resource(relative: str) -> str:
 def main() -> None:
     root = TkinterDnD.Tk()
     try:
-        root.iconbitmap(_resource(os.path.join("assets", "app.ico")))
+        root.iconbitmap(_resource(os.path.join("assets", "icon.ico")))
     except Exception:
         pass  # icon is cosmetic — never crash over it
     app = App(root)

@@ -75,3 +75,14 @@ python main.py
 ```
 
 **Requirements:** Python 3.10+, `tkinterdnd2`
+
+## Building the Windows app
+
+With the venv active:
+
+```bat
+pip install -r requirements-dev.txt
+build.bat
+```
+
+The app is written to `%LOCALAPPDATA%\FileSorterBuild\dist\File Sorter\` (outside the project, so OneDrive sync can't lock the build files) — copy that whole folder to distribute it and run `File Sorter.exe`. The bundled `routing.json` is the default routing; settings, routing edits and the sync log are saved per user in `%APPDATA%\FileSorter`. Replace `assets\icon.ico` to change the app icon.
