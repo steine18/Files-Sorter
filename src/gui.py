@@ -6,7 +6,9 @@ from pathlib import Path
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from src.archive_sync import VisitSyncStatus, populate_remote, scan_local_visits, sync_visit
+from src.archive_sync import (
+    SyncLog, VisitSyncStatus, populate_remote, scan_local_visits, sync_visit,
+)
 from src.config import load_config, save_config
 from src.file_router import (
     DischargeGroup, find_primary_xmls, load_routing, parse_discharge_groups,
@@ -44,6 +46,8 @@ class App(tk.Frame):
 
         # Archive sync tab state
         self._visits: list[VisitSyncStatus] = []
+        self._sync_log = SyncLog()
+        self._scanned_dst_root: str = ""
 
         self._build_ui()
 
@@ -205,6 +209,19 @@ class App(tk.Frame):
         for tag, color in _SYNC_STATUS_COLORS.items():
             self._sync_tree.tag_configure(tag, background=color)
 
+        # --- Summary + filter row ---
+        info_frame = tk.Frame(parent)
+        info_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self._sync_summary_var = tk.StringVar(value="Not scanned yet.")
+        tk.Label(info_frame, textvariable=self._sync_summary_var, anchor="w").pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        self._show_synced_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            info_frame, text="Show synced", variable=self._show_synced_var,
+            command=self._sync_refresh_tree,
+        ).pack(side=tk.RIGHT)
+
         # --- Buttons ---
         btn_frame = tk.Frame(parent)
         btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
@@ -212,6 +229,10 @@ class App(tk.Frame):
         tk.Button(btn_frame, text="Scan", width=10, command=self._sync_scan).pack(
             side=tk.LEFT, padx=(0, 4)
         )
+        tk.Button(
+            btn_frame, text="Full Rescan", width=12,
+            command=lambda: self._sync_scan(full=True),
+        ).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Sync Selected", width=14, command=self._sync_selected).pack(
             side=tk.LEFT, padx=(0, 4)
         )
@@ -465,8 +486,25 @@ class App(tk.Frame):
         """Forget the last scan (its local/remote paths are no longer current)."""
         self._visits = []
         self._sync_tree.delete(*self._sync_tree.get_children())
+        self._sync_summary_var.set("Not scanned yet.")
 
-    def _sync_scan(self) -> None:
+    def _save_sync_log(self) -> None:
+        try:
+            self._sync_log.save()
+        except OSError as exc:
+            messagebox.showwarning(
+                "Could not save sync log",
+                "Results are correct for now, but the next scan will re-check these "
+                f"visits on the archive:\n{exc}",
+                parent=self.master,
+            )
+
+    def _sync_scan(self, full: bool = False) -> None:
+        """Scan local visits and compare with the archive.
+
+        A normal scan skips the archive for visits the sync log already confirms
+        (and that haven't changed locally). full=True checks every visit on the archive.
+        """
         output_dir = self._config.get("output_dir", "")
         dst_root = self._dst_var.get()
         if not output_dir:
@@ -484,7 +522,7 @@ class App(tk.Frame):
         self.master.update()
         try:
             visits = scan_local_visits(output_dir)
-            populate_remote(visits, dst_root)
+            populate_remote(visits, dst_root, log=None if full else self._sync_log)
         except OSError as exc:
             self._sync_invalidate()
             messagebox.showerror(
@@ -496,6 +534,11 @@ class App(tk.Frame):
         finally:
             self.master.config(cursor="")
         self._visits = visits
+        self._scanned_dst_root = dst_root
+
+        # Remember visits just verified as synced; forget ones that no longer are.
+        self._sync_log.update_from(visits, dst_root)
+        self._save_sync_log()
 
         self._sync_refresh_tree()
         if not self._visits:
@@ -507,8 +550,13 @@ class App(tk.Frame):
 
     def _sync_refresh_tree(self) -> None:
         self._sync_tree.delete(*self._sync_tree.get_children())
-        for i, v in enumerate(self._visits):
+        show_synced = self._show_synced_var.get()
+        for i, v in enumerate(self._visits):  # iid = index into self._visits
+            if v.status == "synced" and not show_synced:
+                continue
             date_display = f"{v.date_str[:4]}-{v.date_str[4:6]}-{v.date_str[6:]}"
+            status_text = "Synced (log)" if v.from_log else v.status.capitalize()
+            remote_n = "—" if v.from_log else len(v.remote_files)  # not checked
             self._sync_tree.insert(
                 "",
                 tk.END,
@@ -517,12 +565,25 @@ class App(tk.Frame):
                     v.site_id,
                     date_display,
                     v.water_year_str,
-                    v.status.capitalize(),
+                    status_text,
                     len(v.local_files),
-                    len(v.remote_files),
+                    remote_n,
                 ),
                 tags=(v.status,),
             )
+
+        if not self._visits:
+            self._sync_summary_var.set("Not scanned yet.")
+            return
+        n_synced = sum(v.status == "synced" for v in self._visits)
+        n_log = sum(v.from_log for v in self._visits)
+        n_todo = len(self._visits) - n_synced
+        parts = [f"{len(self._visits)} visits", f"{n_todo} need syncing", f"{n_synced} synced"]
+        if n_log:
+            parts[-1] += f" ({n_log} from log, archive not checked)"
+        if n_synced and not show_synced:
+            parts[-1] += " — hidden"
+        self._sync_summary_var.set(", ".join(parts))
 
     def _sync_selected_visits(self) -> list[VisitSyncStatus]:
         return [self._visits[int(iid)] for iid in self._sync_tree.selection()]
@@ -560,6 +621,10 @@ class App(tk.Frame):
                 all_errors.extend(errors)  # sync_visit keeps v's remote state up to date
         finally:
             self.master.config(cursor="")
+
+        # Visits that are now fully synced go in the log, so the next scan skips them.
+        self._sync_log.update_from(visits, self._scanned_dst_root)
+        self._save_sync_log()
 
         self._sync_refresh_tree()
 

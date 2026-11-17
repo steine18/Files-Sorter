@@ -11,3 +11,5 @@ __pycache__/
 
 # Config (contains local paths)
 config.json
+sync_log.json
+sync_log.json.tmp

@@ -61,7 +61,9 @@ The remote network drive is expected to follow this structure:
             └── SV_<YYYYMMDD>/
 ```
 
-Water year follows the US standard (Oct 1 start). The Archive Sync tab compares every local visit against the remote, color-codes the status (synced / partial / missing), and copies missing files on demand.
+Water year follows the US standard (Oct 1 start). The Archive Sync tab compares every local visit against the remote, color-codes the status (synced / partial / missing), and copies missing or outdated files on demand.
+
+**Sync log.** Once a visit is confirmed fully synced, it is recorded in `sync_log.json` together with a fingerprint of its local files (names, sizes, modification times). Later scans skip the network check for those visits as long as nothing changed locally — adding or editing a file in a visit makes it get re-checked. Synced visits are hidden unless **Show synced** is ticked. Use **Full Rescan** to ignore the log and check every visit on the archive (e.g. if files may have been removed from the archive directly).
 
 ## Setup
 
