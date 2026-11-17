@@ -25,8 +25,10 @@ a = Analysis(
     datas=[
         # tkdnd native library — required for drag-and-drop
         (tkdnd_dir, "tkinterdnd2/tkdnd"),
-        # Ship routing.json alongside the executable so users can edit it
+        # Default routing; user edits are saved to %APPDATA%/FileSorter/routing.json
         ("routing.json", "."),
+        # Window icon, loaded at runtime by main.py (the exe icon is set below)
+        ("assets/icon.ico", "assets"),
     ],
     hiddenimports=["tkinterdnd2"],
     hookspath=[],
@@ -49,7 +51,7 @@ exe = EXE(
     strip=False,
     upx=False,          # UPX compression increases antivirus false-positive rate
     console=False,      # No console window
-    icon="assets/icon.ico",  # Replace with real .ico path when available
+    icon="assets/icon.ico",  # Replace assets/icon.ico to change both exe and window icon
 )
 
 coll = COLLECT(

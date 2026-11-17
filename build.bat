@@ -9,10 +9,15 @@
 :: Then build:
 ::   build.bat
 ::
-:: Output: dist\File Sorter\File Sorter.exe
+:: Output: %LOCALAPPDATA%\FileSorterBuild\dist\File Sorter\File Sorter.exe
+
+:: Build output goes outside the project folder: when the project is in OneDrive,
+:: sync locks freshly written files and PyInstaller fails with "Access is denied"
+:: while replacing the previous build.
+set "OUTROOT=%LOCALAPPDATA%\FileSorterBuild"
 
 echo Building File Sorter...
-pyinstaller "File Sorter.spec" --clean --noconfirm
+pyinstaller "File Sorter.spec" --clean --noconfirm --workpath "%OUTROOT%\build" --distpath "%OUTROOT%\dist"
 
 if %errorlevel% neq 0 (
     echo Build failed.
@@ -20,4 +25,4 @@ if %errorlevel% neq 0 (
 )
 
 echo.
-echo Build complete. Output: dist\File Sorter\File Sorter.exe
+echo Build complete. Output: %OUTROOT%\dist\File Sorter\File Sorter.exe
